@@ -1,0 +1,699 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Direct NVR Live Dashboard & Alert Engine</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Socket.io Client (bundled locally for mobile) -->
+  <script src="socket.io.min.js"></script>
+  <!-- FontAwesome for icons -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    /* Dark glassmorphism styles */
+    body {
+      background-color: #0f172a;
+      color: #f8fafc;
+    }
+    .video-container {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%; /* 16:9 Aspect Ratio */
+    }
+    .video-iframe, .overlay-canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      border: 0;
+    }
+    .overlay-canvas {
+      pointer-events: none;
+    }
+    .overlay-canvas.drawing-mode {
+      pointer-events: auto;
+      cursor: crosshair;
+    }
+
+    /* Camera Card Hover Zoom & Glow Effect */
+    .camera-card {
+      transition: all 0.25s cubic-bezier(.4, 0, .2, 1) !important;
+    }
+    .camera-card:hover {
+      transform: translateY(-4px);
+      border-color: #6366f1 !important;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4), 0 0 15px rgba(99, 102, 241, 0.15);
+    }
+    .camera-card:hover .video-iframe {
+      transform: scale(1.02);
+    }
+
+    :root {
+      --accent-green: #4ade80;
+      --accent-green-glow: #4ade8033;
+      --panel-bg-elevated: #090d16;
+      --panel-border: #1e293b;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --transition-smooth: all .25s cubic-bezier(.4, 0, .2, 1);
+    }
+
+    /* Event Sidebar Styling */
+    .event-card {
+      display: flex;
+      gap: 12px;
+      padding: 10px;
+      background-color: rgba(15, 23, 42, 0.4);
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: var(--transition-smooth);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .event-card::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 3px;
+      height: 100%;
+      background-color: var(--accent-green);
+      opacity: 0;
+      transition: var(--transition-smooth);
+    }
+
+    .event-card:hover {
+      transform: translateX(2px);
+      border-color: rgba(99, 102, 241, 0.4);
+      background-color: rgba(30, 41, 59, 0.5);
+    }
+
+    .event-card:hover::before {
+      opacity: 1;
+    }
+
+    .event-card.unseen::before {
+      opacity: 1;
+      background-color: var(--accent-green);
+    }
+
+    .event-thumb-wrapper {
+      width: 72px;
+      height: 72px;
+      border-radius: 8px;
+      overflow: hidden;
+      background-color: #000;
+      position: relative;
+      flex-shrink: 0;
+      border: 1px solid #1e293b;
+    }
+
+    .event-thumb {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transition: var(--transition-smooth);
+    }
+
+    .event-card:hover .event-thumb {
+      transform: scale(1.05);
+    }
+
+    .event-thumb-fallback {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background-color: #090d16;
+      font-size: 1.1rem;
+    }
+
+    .event-time-block {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      text-align: center;
+      min-width: 58px;
+      border-right: 1px solid #1e293b;
+      padding-right: 10px;
+      gap: 2px;
+      flex-shrink: 0;
+    }
+
+    .event-time-date {
+      font-size: 0.6rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--accent-green);
+      letter-spacing: 0.5px;
+    }
+
+    .event-time-clock {
+      font-size: 0.65rem;
+      font-weight: 700;
+      color: #f1f5f9;
+    }
+
+    .event-details {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      flex-grow: 1;
+      min-width: 0;
+    }
+
+    .event-meta-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .event-camera-name {
+      font-size: 0.7rem;
+      font-weight: 700;
+      color: #94a3b8;
+      text-transform: capitalize;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .event-tag {
+      font-size: 0.6rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      padding: 2px 6px;
+      border-radius: 4px;
+      letter-spacing: 0.5px;
+    }
+
+    .event-tag.person {
+      background-color: rgba(244, 63, 94, 0.15);
+      color: #fb7185;
+      border: 1px solid rgba(244, 63, 94, 0.2);
+    }
+
+    .event-tag.car {
+      background-color: rgba(59, 130, 246, 0.15);
+      color: #60a5fa;
+      border: 1px solid rgba(59, 130, 246, 0.2);
+    }
+
+    .event-tag.cat {
+      background-color: rgba(245, 158, 11, 0.15);
+      color: #fbbf24;
+      border: 1px solid rgba(245, 158, 11, 0.2);
+    }
+
+    .event-tag.default {
+      background-color: rgba(148, 163, 184, 0.15);
+      color: #cbd5e1;
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+
+    /* Filter Chips */
+    .filter-chip {
+      padding: 4px 10px;
+      border-radius: 8px;
+      font-size: 0.6rem;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      background-color: rgba(30, 41, 59, 0.5);
+      border: 1px solid #1e293b;
+      color: #64748b;
+      transition: all 0.2s ease;
+      white-space: nowrap;
+    }
+
+    .filter-chip:hover {
+      background-color: rgba(51, 65, 85, 0.5);
+      color: #94a3b8;
+    }
+
+    .filter-chip.active {
+      background-color: rgba(99, 102, 241, 0.15);
+      border-color: rgba(99, 102, 241, 0.4);
+      color: #818cf8;
+    }
+
+    .no-scrollbar::-webkit-scrollbar {
+      display: none;
+    }
+    .no-scrollbar {
+      -ms-overflow-style: none;
+      scrollbar-width: none;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col font-sans">
+
+  <!-- Header -->
+  <header class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex flex-wrap justify-between items-center gap-4 shadow-lg">
+    <div class="flex items-center gap-3">
+      <div class="bg-indigo-600 p-2.5 rounded-lg shadow-md flex items-center justify-center">
+        <i class="fa-solid fa-eye-slash text-xl text-white"></i>
+      </div>
+      <div>
+        <h1 class="text-xl font-bold tracking-tight text-white">Direct NVR Smart Monitor</h1>
+        <p class="text-[11px] text-slate-400">Direct Live WebRTC Streams with Edge AI scanning windows</p>
+        <p class="text-[9px] text-slate-500 font-medium leading-relaxed mt-0.5"><i class="fa-solid fa-heart text-rose-500"></i> Based on the brilliant <a href="https://github.com/blakeblackshear/frigate" target="_blank" class="text-indigo-400 hover:text-indigo-300 transition hover:underline">Frigate</a> project by Blake Blackshear</p>
+      </div>
+    </div>
+
+    <div class="flex items-center gap-3 animate-fade-in">
+      <!-- Profile Selector -->
+      <div class="flex items-center gap-1.5 bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 shadow-sm text-slate-200">
+        <i class="fa-solid fa-server text-indigo-400 text-xs"></i>
+        <select id="header-profile-selector" class="bg-transparent border-none text-sm focus:outline-none cursor-pointer pr-1">
+          <option value="default" class="bg-slate-900">Loading Server...</option>
+        </select>
+      </div>
+      <button id="open-settings-btn" class="bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-4 py-2 rounded-lg flex items-center gap-2 transition duration-200 shadow-sm">
+        <i class="fa-solid fa-sliders"></i> Settings & SMTP
+      </button>
+      <div class="flex items-center gap-2 bg-slate-800/80 px-4 py-2 rounded-lg border border-slate-700 text-sm">
+        <span class="relative flex h-2.5 w-2.5">
+          <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+          <span class="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+        </span>
+        <span id="conn-status" class="text-slate-300 font-semibold">Connecting...</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Work Area -->
+  <main class="flex-1 flex flex-col lg:flex-row gap-6 p-6">
+    <!-- Camera Grid Panel -->
+    <div class="flex-1 flex flex-col gap-4">
+      <div class="flex justify-between items-center">
+        <div class="flex items-center gap-3">
+          <h2 class="text-lg font-bold flex items-center gap-2">
+            <i class="fa-solid fa-video text-indigo-400"></i> Active Feeds
+          </h2>
+          <button id="refresh-streams-btn" title="Refresh Live Feeds" class="text-slate-400 hover:text-indigo-400 transition hover:rotate-180 duration-500 text-sm">
+            <i class="fa-solid fa-arrows-rotate"></i>
+          </button>
+        </div>
+        <span id="cam-count" class="bg-indigo-900/40 text-indigo-300 border border-indigo-500/30 px-2.5 py-0.5 rounded-full text-xs font-semibold">0 Streams Detected</span>
+      </div>
+
+      <!-- Video Stream Grid -->
+      <div id="camera-grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
+        <!-- Cameras dynamically loaded here -->
+        <div class="col-span-full py-16 flex flex-col items-center justify-center text-slate-500 bg-slate-900/20 rounded-xl border border-dashed border-slate-800">
+          <i class="fa-solid fa-spinner animate-spin text-4xl mb-4 text-indigo-500"></i>
+          <p class="text-lg font-medium text-slate-400">Discovering Camera Feeds...</p>
+          <p class="text-sm text-slate-500 mt-1">Reading direct go2rtc streams from config.yml</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Live Event Log Panel -->
+    <div class="w-full lg:w-96 bg-slate-900/60 border border-slate-800 rounded-xl p-5 flex flex-col gap-4 shadow-xl backdrop-blur-md">
+      <div class="flex justify-between items-center border-b border-slate-800 pb-3">
+        <h3 class="font-bold text-slate-200 flex items-center gap-2">
+          <i class="fa-solid fa-bell text-indigo-400 animate-bounce text-sm"></i> <span id="sidebar-title-server">Home Server</span> Detections
+        </h3>
+        <span id="sidebar-event-counter" class="bg-indigo-900/40 text-indigo-300 border border-indigo-500/30 px-2.5 py-0.5 rounded-full text-[10px] font-semibold">0 Total</span>
+      </div>
+
+      <!-- AI Semantic Search & Filters -->
+      <div class="space-y-3">
+        <div class="relative group">
+          <div class="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none">
+            <i class="fa-solid fa-magnifying-glass text-slate-500 group-focus-within:text-indigo-400 transition-colors text-xs"></i>
+          </div>
+          <input
+            type="text"
+            id="ai-search-input"
+            placeholder="Search AI History..."
+            class="w-full bg-slate-950/80 border border-slate-800 rounded-xl pl-9 pr-4 py-2 text-xs text-slate-300 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/20 transition-all placeholder:text-slate-600"
+          />
+          <div id="ai-search-loader" class="absolute inset-y-0 right-3 flex items-center hidden">
+            <i class="fa-solid fa-spinner animate-spin text-indigo-500 text-xs"></i>
+          </div>
+        </div>
+
+        <!-- Quick Filter Chips -->
+        <div class="flex flex-wrap gap-2 overflow-x-auto pb-1 no-scrollbar">
+          <button onclick="setQuickFilter('all')" class="filter-chip active" id="filter-all">All</button>
+          <button onclick="setQuickFilter('person')" class="filter-chip" id="filter-person">Persons</button>
+          <button onclick="setQuickFilter('car')" class="filter-chip" id="filter-car">Vehicles</button>
+          <button onclick="setQuickFilter('dog')" class="filter-chip" id="filter-dog">Dogs</button>
+          <button onclick="setQuickFilter('bear')" class="filter-chip" id="filter-bear">Bears</button>
+        </div>
+      </div>
+
+      <!-- Notifications Container -->
+      <div id="alert-list" class="flex-1 overflow-y-auto max-h-[500px] lg:max-h-[62vh] space-y-3 pr-1 scrollbar-thin scrollbar-thumb-slate-800">
+        <div id="no-alerts-placeholder" class="text-center py-12 text-slate-500">
+          <i class="fa-solid fa-shield text-3xl mb-3 text-slate-700"></i>
+          <p class="text-sm font-medium text-slate-400">System Secure</p>
+          <p class="text-xs text-slate-500 mt-1">Ready for real-time detections</p>
+        </div>
+      </div>
+
+      <!-- Pagination Footer -->
+      <div id="sidebar-pagination" class="flex justify-between items-center border-t border-slate-800 pt-3 text-xs text-slate-400">
+        <button id="sidebar-prev-page-btn" class="bg-slate-850 hover:bg-slate-800 hover:text-slate-200 border border-slate-800 px-3 py-1.5 rounded-lg font-semibold disabled:opacity-40 disabled:hover:bg-slate-850 disabled:hover:text-slate-400 transition" disabled>
+          ◄ Previous
+        </button>
+        <span id="sidebar-page-label" class="font-semibold text-slate-400">Page 1 of 1</span>
+        <button id="sidebar-next-page-btn" class="bg-slate-850 hover:bg-slate-800 hover:text-slate-200 border border-slate-800 px-3 py-1.5 rounded-lg font-semibold disabled:opacity-40 disabled:hover:bg-slate-850 disabled:hover:text-slate-400 transition" disabled>
+          Next ►
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Settings Configuration Drawer / Modal -->
+  <div id="settings-modal" class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl max-h-[90vh] overflow-y-auto shadow-2xl flex flex-col">
+      <!-- Modal Header -->
+      <div class="flex justify-between items-center border-b border-slate-800 px-6 py-4">
+        <h3 class="text-lg font-bold text-slate-200 flex items-center gap-2">
+          <i class="fa-solid fa-gears text-indigo-500"></i> Settings & Notification Config
+        </h3>
+        <button id="close-settings-btn" class="text-slate-400 hover:text-slate-200 transition">
+          <i class="fa-solid fa-xmark text-xl"></i>
+        </button>
+      </div>
+
+      <!-- Modal Body -->
+      <form id="settings-form" class="p-6 space-y-6">
+        <!-- App Connection Settings -->
+        <div id="app-connection-settings" class="space-y-4 bg-indigo-950/20 p-4 rounded-xl border border-indigo-900/40">
+          <h4 class="text-sm font-bold uppercase tracking-wider text-indigo-400 border-b border-slate-800 pb-1 flex items-center gap-1.5">
+            <i class="fa-solid fa-link"></i> App Connection Settings
+          </h4>
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 mb-1.5">Backend Server URL</label>
+            <input type="text" id="backend-url-input" placeholder="e.g. http://192.168.0.53:3010" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            <p class="text-[10px] text-slate-500 mt-1">Specify the remote URL of your Direct NVR backend server (include protocol and port, e.g. http://192.168.1.100:3010).</p>
+          </div>
+        </div>
+
+        <!-- Profile Management Section -->
+        <div class="space-y-4 bg-slate-950/40 p-4 rounded-xl border border-slate-800">
+          <h4 class="text-sm font-bold uppercase tracking-wider text-indigo-400 border-b border-slate-800 pb-1 flex items-center gap-1.5">
+            <i class="fa-solid fa-server animate-pulse"></i> Server Profile Management
+          </h4>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Active Profile Name</label>
+              <input type="text" id="profile-name-input" placeholder="e.g. Home Server" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+              <p class="text-[10px] text-slate-500 mt-1">Change the name of the currently selected server profile.</p>
+            </div>
+            <div class="flex items-end gap-2.5">
+              <button type="button" id="create-profile-btn" class="flex-1 bg-emerald-800 hover:bg-emerald-700 text-emerald-100 border border-emerald-600 px-3.5 py-2 rounded-lg text-xs font-bold transition duration-200 shadow-sm flex items-center justify-center gap-1.5">
+                <i class="fa-solid fa-plus"></i> New Server Profile
+              </button>
+              <button type="button" id="delete-profile-btn" class="flex-1 bg-rose-950 hover:bg-rose-900 text-rose-200 border border-rose-800 px-3.5 py-2 rounded-lg text-xs font-bold transition duration-200 shadow-sm flex items-center justify-center gap-1.5">
+                <i class="fa-solid fa-trash-can"></i> Delete Profile
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- SMTP Config Section -->
+        <div class="space-y-4">
+          <div class="flex items-center justify-between border-b border-slate-800 pb-1">
+            <h4 class="text-sm font-bold uppercase tracking-wider text-indigo-400 flex items-center gap-1.5">
+              <i class="fa-solid fa-envelope"></i> Gmail SMTP Server
+            </h4>
+            <div class="flex items-center gap-2">
+              <input type="checkbox" id="smtp-enabled" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800 h-4.5 w-4.5 cursor-pointer">
+              <label for="smtp-enabled" class="text-xs text-slate-300 font-semibold cursor-pointer select-none">Enable email alerts</label>
+            </div>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">SMTP Host</label>
+              <input type="text" id="smtp-host" value="smtp.gmail.com" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">SMTP Port</label>
+              <input type="number" id="smtp-port" value="465" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div class="md:col-span-2">
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Gmail User Address (Sender Email)</label>
+              <input type="email" id="smtp-user" placeholder="yourname@gmail.com" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div class="md:col-span-2">
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Gmail App Password (16 characters, no spaces)</label>
+              <div class="relative">
+                <input type="password" id="smtp-pass" placeholder="xxxx xxxx xxxx xxxx" class="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3.5 pr-10 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+                <button type="button" id="toggle-smtp-pass" class="absolute right-3 top-2.5 text-slate-500 hover:text-slate-300"><i class="fa-solid fa-eye"></i></button>
+              </div>
+              <p class="text-[10px] text-slate-500 mt-1">Requires standard Google Accounts App Password. Do NOT enter your main password.</p>
+            </div>
+            <div class="md:col-span-2">
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Alert Recipient Address (Leave empty to mail yourself)</label>
+              <input type="email" id="smtp-to" placeholder="recipient@example.com" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+          </div>
+        </div>
+
+        <!-- Detection & Stream Config Section -->
+        <div class="space-y-4">
+          <h4 class="text-sm font-bold uppercase tracking-wider text-indigo-400 border-b border-slate-800 pb-1 flex items-center gap-1.5">
+            <i class="fa-solid fa-circle-nodes"></i> Detection & Streams
+          </h4>
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">go2rtc Host / IP (Leave empty for auto)</label>
+              <input type="text" id="go2rtc-host" placeholder="Auto-detecting..." class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+              <p class="text-[10px] text-slate-500 mt-1">Leave empty to automatically match your active Frigate server.</p>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">MQTT Broker Host / IP (Leave empty for auto)</label>
+              <input type="text" id="mqtt-host" placeholder="Auto-detecting..." class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+              <p class="text-[10px] text-slate-500 mt-1">Leave empty to match your Frigate config or Frigate server IP.</p>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">MQTT Broker Username (Leave empty if none)</label>
+              <input type="text" id="mqtt-user" placeholder="Username..." class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">MQTT Broker Password (Leave empty if none)</label>
+              <div class="relative">
+                <input type="password" id="mqtt-pass" placeholder="Password..." class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500 pr-10">
+                <button type="button" id="toggle-mqtt-pass" class="absolute right-3 top-2.5 text-slate-500 hover:text-slate-300"><i class="fa-solid fa-eye"></i></button>
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">go2rtc Port / Connection Mode</label>
+              <select id="go2rtc-port" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+                <option value="5000">Port 5000 (Frigate Proxy - Recommended)</option>
+                <option value="1984">Port 1984 (Direct go2rtc)</option>
+              </select>
+              <p class="text-[10px] text-slate-500 mt-1">Port 5000 proxies WebRTC through Frigate's API. Port 1984 is directly to go2rtc.</p>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Streaming Protocol Mode</label>
+              <select id="connection-mode" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500">
+                <option value="mjpeg">MJPEG Stream (100% Reliable & CORS-immune)</option>
+                <option value="webrtc">WebRTC Direct (Ultra-Low Latency, requires LAN routing)</option>
+              </select>
+              <p class="text-[10px] text-slate-500 mt-1">MJPEG stream is guaranteed to work. WebRTC requires proper Docker ICE candidate routing.</p>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Confidence Threshold (0.1 - 0.9)</label>
+              <input type="number" id="confidence-threshold" step="0.05" min="0.1" max="0.9" value="0.5" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500" required>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Frame Check Interval (ms)</label>
+              <input type="number" id="check-interval" step="500" min="1000" value="3000" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500" required>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Save Video Clips (from Frigate)</label>
+              <div class="flex items-center gap-2.5 mt-2.5">
+                <input type="checkbox" id="save-clips" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800 h-4.5 w-4.5 cursor-pointer">
+                <span class="text-xs text-slate-300 cursor-pointer select-none" onclick="document.getElementById('save-clips').click()">Enable event clip downloads</span>
+              </div>
+            </div>
+            <div>
+              <label class="block text-xs font-semibold text-slate-400 mb-1.5">Clip Duration (seconds)</label>
+              <input type="number" id="clip-duration" min="2" max="60" value="5" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-sm text-slate-300 focus:outline-none focus:border-indigo-500" required>
+            </div>
+          </div>
+
+          <!-- Class Selection checkboxes -->
+          <div>
+            <label class="block text-xs font-semibold text-slate-400 mb-2">Tracked Classes</label>
+            <div class="grid grid-cols-2 md:grid-cols-3 gap-3 bg-slate-950/40 border border-slate-800 rounded-xl p-4">
+              <label class="flex items-center gap-2.5 text-slate-300 cursor-pointer hover:text-white">
+                <input type="checkbox" name="classes" value="person" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"> Person
+              </label>
+              <label class="flex items-center gap-2.5 text-slate-300 cursor-pointer hover:text-white">
+                <input type="checkbox" name="classes" value="car" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"> Car / Vehicles
+              </label>
+              <label class="flex items-center gap-2.5 text-slate-300 cursor-pointer hover:text-white">
+                <input type="checkbox" name="classes" value="cat" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"> Cat / Raccoon
+              </label>
+              <label class="flex items-center gap-2.5 text-slate-300 cursor-pointer hover:text-white">
+                <input type="checkbox" name="classes" value="dog" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"> Dog
+              </label>
+              <label class="flex items-center gap-2.5 text-slate-300 cursor-pointer hover:text-white">
+                <input type="checkbox" name="classes" value="bear" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"> Bear / Large Game
+              </label>
+              <label class="flex items-center gap-2.5 text-slate-300 cursor-pointer hover:text-white">
+                <input type="checkbox" name="classes" value="bird" class="rounded text-indigo-600 focus:ring-indigo-500 bg-slate-950 border-slate-800"> Bird / Squirrel
+              </label>
+            </div>
+          </div>
+
+          <!-- AI & Gemini Configuration Section -->
+          <div class="space-y-4 bg-indigo-950/10 p-4 rounded-xl border border-indigo-900/30">
+            <h4 class="text-xs font-black uppercase tracking-[0.2em] text-indigo-400 flex items-center gap-2">
+              <i class="fa-solid fa-brain"></i> AI Vision Configuration
+            </h4>
+            <div>
+              <label class="block text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Google Gemini API Key</label>
+              <div class="relative">
+                <input type="password" id="gemini-api-key" placeholder="AIzaSy..." class="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3.5 pr-10 py-2.5 text-sm text-indigo-200 focus:outline-none focus:border-indigo-500 transition-colors font-mono">
+                <button type="button" id="toggle-gemini-pass" class="absolute right-3 top-3 text-slate-600 hover:text-indigo-400 transition-colors"><i class="fa-solid fa-eye"></i></button>
+              </div>
+              <p class="text-[9px] text-slate-600 mt-2 leading-relaxed">Required for <strong>Tactical AI Briefs</strong> and <strong>Semantic Event Search</strong>. Get a free key at <a href="https://aistudio.google.com/" target="_blank" class="text-indigo-400 hover:underline">Google AI Studio</a>.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Modal Footer -->
+        <div class="flex justify-end gap-3 border-t border-slate-800 pt-5">
+          <button type="button" id="cancel-settings-btn" class="px-5 py-2 border border-slate-800 hover:bg-slate-800/50 rounded-lg text-slate-400 hover:text-slate-200 text-sm transition">
+            Cancel
+          </button>
+          <button type="submit" class="px-6 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-white font-semibold text-sm transition shadow-lg shadow-indigo-600/25 flex items-center gap-2">
+            <i class="fa-solid fa-floppy-disk"></i> Save Settings
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Zoomed Camera Feed Lightbox Modal -->
+  <div id="zoom-modal" class="fixed inset-0 bg-slate-950/95 backdrop-blur-md z-50 flex items-center justify-center p-6 hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-5xl shadow-2xl flex flex-col overflow-hidden">
+      <!-- Modal Header -->
+      <div class="flex justify-between items-center border-b border-slate-800 px-6 py-4">
+        <div class="flex items-center gap-3">
+          <span class="h-2.5 w-2.5 rounded-full bg-indigo-500 animate-pulse"></span>
+          <h3 id="zoom-title" class="text-base font-bold text-slate-100 capitalize">Camera Feed Zoom</h3>
+        </div>
+        <button id="close-zoom-btn" class="text-slate-400 hover:text-slate-200 text-xl transition bg-slate-800/80 hover:bg-slate-800 h-9 w-9 rounded-full flex items-center justify-center">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- Modal Body (Large Stream Container) -->
+      <div class="relative flex-1 min-h-0 bg-black flex items-center justify-center p-4 overflow-hidden" id="zoom-container-outer">
+        <div class="w-full h-full max-w-full max-h-full aspect-video relative shadow-2xl rounded-lg border border-slate-800 overflow-hidden bg-zinc-900 flex items-center justify-center" id="zoom-container">
+          <!-- Dynamically loaded player goes here -->
+          <canvas id="zoom-canvas" class="overlay-canvas w-full h-full object-contain"></canvas>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Event Details Lightbox Modal (Snapshot & Play Clip Modes) -->
+  <div id="clip-modal" class="fixed inset-0 bg-slate-950/95 backdrop-blur-md z-50 flex items-center justify-center p-6 hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-3xl w-full max-w-3xl shadow-2xl flex flex-col overflow-hidden">
+      <!-- Modal Header -->
+      <div class="flex justify-between items-center border-b border-slate-800 px-6 py-4">
+        <div class="flex items-center gap-3">
+          <i class="fa-solid fa-circle-play text-indigo-400 animate-pulse text-lg"></i>
+          <h3 id="clip-title" class="text-base font-bold text-slate-100 capitalize">Event Details</h3>
+        </div>
+        <button id="close-clip-btn" class="text-slate-400 hover:text-slate-200 text-xl transition bg-slate-800/80 hover:bg-slate-800 h-9 w-9 rounded-full flex items-center justify-center">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+      </div>
+
+      <!-- Modal Body (Interchangeable media viewport) -->
+      <div class="relative w-full aspect-video bg-black flex items-center justify-center overflow-hidden">
+        <!-- Snapshot Viewer -->
+        <img id="clip-snapshot-viewer" class="w-full h-full object-contain absolute inset-0 hidden" alt="Event Snapshot" />
+        <!-- Clip Player -->
+        <video id="clip-player" controls class="w-full h-full object-contain absolute inset-0 hidden" playsinline></video>
+      </div>
+
+      <!-- Modal Footer (Meta details and view switchers) -->
+      <div class="flex flex-col border-t border-slate-800 bg-slate-950/30">
+        <!-- AI Brief Section (Collapsible) -->
+        <div id="ai-brief-container" class="hidden px-6 py-4 bg-indigo-950/20 border-b border-indigo-900/30">
+          <div class="flex items-center gap-2 mb-2">
+            <i class="fa-solid fa-brain text-indigo-400 text-xs animate-pulse"></i>
+            <span class="text-[10px] font-black uppercase tracking-widest text-indigo-300">Tactical AI Assessment</span>
+          </div>
+          <p id="ai-brief-text" class="text-xs text-slate-300 leading-relaxed italic"></p>
+          <div id="ai-brief-meta" class="flex gap-4 mt-3 pt-3 border-t border-indigo-900/20">
+            <div class="flex flex-col">
+              <span class="text-[9px] uppercase font-bold text-slate-500">Threat Level</span>
+              <span id="ai-brief-threat" class="text-[11px] font-black"></span>
+            </div>
+            <div class="flex flex-col flex-1">
+              <span class="text-[9px] uppercase font-bold text-slate-500">Recommendation</span>
+              <span id="ai-brief-action" class="text-[11px] text-slate-400 font-medium"></span>
+            </div>
+          </div>
+        </div>
+
+        <div class="flex justify-between items-center px-6 py-4">
+          <div class="flex flex-col text-xs text-slate-400 gap-0.5">
+            <span id="clip-modal-label">Detected: -</span>
+            <span id="clip-modal-time">Time: -</span>
+          </div>
+          <div class="flex gap-2.5">
+            <button id="ai-brief-btn" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold text-xs transition flex items-center gap-1.5 shadow-lg shadow-indigo-600/20">
+              <i class="fa-solid fa-brain"></i> Generate AI Brief
+            </button>
+            <button id="view-snapshot-btn" class="px-4 py-2 border rounded-lg font-semibold text-xs transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-image"></i> View Snapshot
+            </button>
+            <button id="view-clip-btn" class="px-4 py-2 border rounded-lg font-semibold text-xs transition flex items-center gap-1.5 shadow-sm">
+              <i class="fa-solid fa-play"></i> Play Clip
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Initial Setup / Backend URL Prompt Overlay -->
+  <div id="setup-overlay" class="fixed inset-0 bg-slate-950/95 backdrop-blur-md z-50 flex items-center justify-center p-4 hidden">
+    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-6">
+      <div class="text-center space-y-2">
+        <div class="mx-auto w-12 h-12 rounded-full bg-indigo-950 flex items-center justify-center border border-indigo-500/30 text-indigo-400 text-xl animate-bounce">
+          <i class="fa-solid fa-server"></i>
+        </div>
+        <h3 class="text-lg font-bold text-slate-100">Connect to Backend Server</h3>
+        <p class="text-xs text-slate-400">Please provide the IP address or URL of your running Direct NVR backend server to start streaming.</p>
+      </div>
+      <div class="space-y-4">
+        <div>
+          <label class="block text-xs font-semibold text-slate-400 mb-1.5">Server URL</label>
+          <input type="text" id="setup-backend-url-input" placeholder="e.g. http://192.168.0.53:3010" class="w-full bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+          <p class="text-[10px] text-slate-500 mt-1.5">Include protocol and port. E.g., http://100.116.224.43:3010 or Tailscale IP.</p>
+        </div>
+        <button id="save-setup-btn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-2.5 rounded-lg text-sm transition duration-200 shadow-sm flex items-center justify-center gap-2">
+          <i class="fa-solid fa-plug"></i> Connect & Initialize
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Custom App Scripts -->
+  <script src="capacitor.js"></script>
+  <script src="app.js?v=2.0"></script>
+</body>
+</html>

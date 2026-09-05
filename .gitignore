@@ -1,0 +1,14 @@
+node_modules/
+public/clips/*.mp4
+settings.json
+alerts_history.json
+rois.json
+exclusions.json
+detections_state.json
+nohup.out
+.env
+.DS_Store
+.idea/
+*.idea
+**/android/.idea/
+*.zip

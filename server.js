@@ -1,0 +1,1347 @@
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const fs = require('fs');
+const path = require('path');
+const yaml = require('js-yaml');
+const { spawn } = require('child_process');
+const mqtt = require('mqtt');
+const nodemailer = require('nodemailer');
+const cors = require('cors');
+const { Transform } = require('stream');
+const { GoogleGenAI } = require('@google/genai');
+require('dotenv').config();
+
+// In-Memory HEVC (H.265) binary patcher to convert 'hev1' containers to Apple-compatible 'hvc1' containers
+class HevcPatchStream extends Transform {
+  constructor() {
+    super();
+    this.tail = Buffer.alloc(0);
+    this.search = Buffer.from('hev1');
+    this.replace = Buffer.from('hvc1');
+  }
+
+  _transform(chunk, encoding, callback) {
+    // Prepend the tail from the last chunk to catch split tags
+    let data = Buffer.concat([this.tail, chunk]);
+    let pos = 0;
+
+    // Find and replace all occurrences
+    while ((pos = data.indexOf(this.search, pos)) !== -1) {
+      this.replace.copy(data, pos);
+      pos += 4;
+    }
+
+    // Keep the last 3 bytes as tail (in case 'hev' is at the end of the chunk)
+    const tailSize = this.search.length - 1;
+    if (data.length > tailSize) {
+      this.push(data.slice(0, data.length - tailSize));
+      this.tail = data.slice(data.length - tailSize);
+    } else {
+      this.tail = data;
+    }
+    callback();
+  }
+
+  _flush(callback) {
+    this.push(this.tail);
+    callback();
+  }
+}
+
+const PORT = process.env.PORT || 3010;
+const app = express();
+
+// Enable CORS for all origins (important for mobile/hybrid app connections)
+app.use(cors());
+
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+app.use(express.json());
+
+// Helper for Local Ollama or Gemini AI calls
+async function performAiQuery(prompt, isJson = true) {
+  const ollamaUrl = process.env.OLLAMA_URL; // e.g. http://localhost:11434
+  const ollamaModel = process.env.OLLAMA_MODEL || 'llama3';
+
+  if (ollamaUrl) {
+    try {
+      console.log(`[AI] Using local Ollama (${ollamaModel}) at ${ollamaUrl}...`);
+      const response = await fetch(`${ollamaUrl}/api/generate`, {
+        method: 'POST',
+        body: JSON.stringify({
+          model: ollamaModel,
+          prompt: prompt,
+          stream: false,
+          format: isJson ? 'json' : undefined
+        })
+      });
+      const data = await response.json();
+      return data.response;
+    } catch (err) {
+      console.warn(`[AI] Ollama failed: ${err.message}. Falling back...`);
+    }
+  }
+
+  const ai = getAiClient();
+  if (ai) {
+    console.log(`[AI] Using Google Gemini 3.1 Flash-Lite...`);
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.1-flash-lite-preview',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+      },
+    });
+    return response.text;
+  }
+
+  return null;
+}
+app.use(express.text({ type: ['application/sdp', 'text/plain'] }));
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Configuration Paths
+const FRIGATE_CONFIG_PATH = '/Users/jim/config.yml';
+const ROIS_FILE_PATH = path.join(__dirname, 'rois.json');
+const EXCLUSIONS_FILE_PATH = path.join(__dirname, 'exclusions.json');
+const DETECTIONS_STATE_PATH = path.join(__dirname, 'detections_state.json');
+const SETTINGS_FILE_PATH = path.join(__dirname, 'settings.json');
+const ALERTS_HISTORY_PATH = path.join(__dirname, 'alerts_history.json');
+const CLIPS_DIR = path.join(__dirname, 'public', 'clips');
+
+// Auto-create clips folder if it does not exist
+if (!fs.existsSync(CLIPS_DIR)) {
+  fs.mkdirSync(CLIPS_DIR, { recursive: true });
+}
+
+// Global App State
+let aiClient = null;
+let cameras = {}; // cameraName -> { name, rtspUrl, go2rtcStreamName, enabled }
+let rois = {};    // cameraName -> Array of polygonal points (normalized [0..1])
+let exclusions = {}; // cameraName -> Array of polygonal points (normalized [0..1])
+let settings = {
+  smtp: {
+    enabled: true,
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true,
+    user: '',
+    pass: '',
+    to: ''
+  },
+  detection: {
+    intervalMs: 3000, // Detect every 3 seconds
+    confidenceThreshold: 0.5,
+    allowedClasses: ['person', 'car', 'cat', 'dog', 'bear', 'bird'], // standard COCO classes
+    saveClips: true,  // Save clip of detection event
+    clipDuration: 5   // Duration in seconds
+  },
+  go2rtcHost: '', // will be auto-discovered on startup if empty
+  go2rtcPort: '5000', // '5000' (Frigate Proxy) or '1984' (Direct go2rtc)
+  connectionMode: 'mjpeg', // 'mjpeg' (100% bulletproof) or 'webrtc' (native WebRTC)
+  mqttHost: '',
+  mqttUser: '',
+  mqttPass: '',
+  geminiApiKey: '',
+  activeProfileId: 'default',
+  profiles: []
+};
+
+// Object Tracker State (mainly for parked cars)
+// cameraName -> Array of active tracks
+const activeTracks = {};
+const TRACK_EXPIRY_MS = 60000; // 1 minute timeout to remove lost tracks
+const STATIONARY_TIME_THRESHOLD_MS = 300000; // 5 minutes
+
+// Load saved data
+if (fs.existsSync(ROIS_FILE_PATH)) {
+  try {
+    rois = JSON.parse(fs.readFileSync(ROIS_FILE_PATH, 'utf8'));
+  } catch (err) {
+    console.error('Error reading rois.json:', err);
+  }
+}
+
+if (fs.existsSync(EXCLUSIONS_FILE_PATH)) {
+  try {
+    exclusions = JSON.parse(fs.readFileSync(EXCLUSIONS_FILE_PATH, 'utf8'));
+  } catch (err) {
+    console.error('Error reading exclusions.json:', err);
+  }
+}
+
+let detectionsState = {}; // cameraName -> boolean
+if (fs.existsSync(DETECTIONS_STATE_PATH)) {
+  try {
+    detectionsState = JSON.parse(fs.readFileSync(DETECTIONS_STATE_PATH, 'utf8'));
+  } catch (err) {
+    console.error('Error reading detections_state.json:', err);
+  }
+}
+
+if (fs.existsSync(SETTINGS_FILE_PATH)) {
+  try {
+    const savedSettings = JSON.parse(fs.readFileSync(SETTINGS_FILE_PATH, 'utf8'));
+    settings = { ...settings, ...savedSettings };
+  } catch (err) {
+    console.error('Error reading settings.json:', err);
+  }
+}
+
+let alertsHistory = [];
+if (fs.existsSync(ALERTS_HISTORY_PATH)) {
+  try {
+    alertsHistory = JSON.parse(fs.readFileSync(ALERTS_HISTORY_PATH, 'utf8'));
+    // Migrate old local clip paths to same-origin dynamic event API proxy URLs
+    let migrated = false;
+    alertsHistory.forEach(alert => {
+      if (alert.clipUrl && alert.clipUrl.startsWith('/clips/')) {
+        // Extract the eventId from the filename.
+        // Filename has format: clip_<camera>_frigate-<eventId>_<timestamp>.mp4
+        // eventId can have format: 1787925112.60248-p7y77m
+        const matches = alert.clipUrl.match(/frigate-([a-zA-Z0-9\.-]+)/);
+        if (matches && matches[1]) {
+          // Remove trailing timestamp if present (e.g. 1787925112.60248-p7y77m_1787925165615.mp4 -> 1787925112.60248-p7y77m)
+          let eventIdPart = matches[1];
+          const parts = eventIdPart.split('_');
+          if (parts.length > 0) {
+            eventIdPart = parts[0];
+          }
+          if (eventIdPart.endsWith('.mp4')) {
+            eventIdPart = eventIdPart.substring(0, eventIdPart.length - 4);
+          }
+          alert.clipUrl = `/api/events/${eventIdPart}/clip.mp4`;
+          migrated = true;
+        }
+      }
+    });
+    if (migrated) {
+      fs.writeFileSync(ALERTS_HISTORY_PATH, JSON.stringify(alertsHistory, null, 2), 'utf8');
+      console.log('[MIGRATION] Migrated alerts_history.json clip paths to same-origin dynamic event API proxy URLs.');
+    }
+  } catch (err) {
+    console.error('Error reading alerts_history.json:', err);
+  }
+}
+
+// Migrate to profiles if not present or empty
+if (!settings.profiles || !Array.isArray(settings.profiles) || settings.profiles.length === 0) {
+  const defaultProfile = {
+    id: 'default',
+    name: 'Home Server',
+    go2rtcHost: settings.go2rtcHost || '',
+    go2rtcPort: settings.go2rtcPort || '5000',
+    connectionMode: settings.connectionMode || 'mjpeg',
+    mqttHost: settings.mqttHost || '',
+    mqttUser: settings.mqttUser || '',
+    mqttPass: settings.mqttPass || '',
+    geminiApiKey: settings.geminiApiKey || '',
+    smtp: { ...settings.smtp },
+    detection: { ...settings.detection }
+  };
+  settings.activeProfileId = 'default';
+  settings.profiles = [defaultProfile];
+  fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2), 'utf8');
+} else {
+  // Synchronize active profile settings to top-level key cache
+  const activeProfile = settings.profiles.find(p => p.id === settings.activeProfileId) || settings.profiles[0];
+  if (activeProfile) {
+    settings.activeProfileId = activeProfile.id;
+    settings.go2rtcHost = activeProfile.go2rtcHost;
+    settings.go2rtcPort = activeProfile.go2rtcPort;
+    settings.connectionMode = activeProfile.connectionMode;
+    settings.mqttHost = activeProfile.mqttHost;
+    settings.mqttUser = activeProfile.mqttUser;
+    settings.mqttPass = activeProfile.mqttPass;
+    settings.geminiApiKey = activeProfile.geminiApiKey || '';
+    settings.smtp = { ...activeProfile.smtp };
+    settings.detection = { ...activeProfile.detection };
+  }
+}
+
+// AI Client Initializer
+function getAiClient() {
+  const apiKey = process.env.GEMINI_API_KEY || settings.geminiApiKey;
+  if (!apiKey) {
+    console.warn('[AI] Warning: GEMINI_API_KEY not found in environment or settings. AI features will use basic fallback template.');
+    return null;
+  }
+  if (!aiClient) {
+    console.log('[AI] Success: GEMINI_API_KEY found. Initializing Gemini 3.7 Flash client...');
+    // The @google/genai SDK v2.x expects an object with apiKey
+    aiClient = new GoogleGenAI({ apiKey });
+  }
+  return aiClient;
+}
+
+// Probes potential IP addresses to find the active Frigate instance
+async function discoverFrigateIP() {
+  const candidateIPs = ['localhost', '127.0.0.1', '192.168.2.210', '192.168.2.71'];
+  
+  for (const ip of candidateIPs) {
+    try {
+      console.log(`Probing Frigate API at http://${ip}:5000/...`);
+      const res = await fetch(`http://${ip}:5000/api/version`, { signal: AbortSignal.timeout(1000) });
+      if (res.ok) {
+        console.log(`Found active Frigate instance at ${ip}!`);
+        return ip;
+      }
+    } catch (e) {
+      // ignore probe failures
+    }
+  }
+  console.log('No external Frigate API found. Defaulting to localhost.');
+  return 'localhost';
+}
+
+// Helper to parse Frigate configuration and resolve camera direct RTSP streams
+function parseFrigateConfig() {
+  if (!fs.existsSync(FRIGATE_CONFIG_PATH)) {
+    console.error(`Frigate config not found at ${FRIGATE_CONFIG_PATH}`);
+    return;
+  }
+
+  try {
+    const fileContent = fs.readFileSync(FRIGATE_CONFIG_PATH, 'utf8');
+    const doc = yaml.load(fileContent);
+
+    if (!doc || !doc.cameras) {
+      console.warn('No cameras found in Frigate configuration.');
+      return;
+    }
+
+    if (doc.mqtt) {
+      if (doc.mqtt.host && !settings.mqttHost) {
+        settings.mqttHost = doc.mqtt.host;
+      }
+      if (doc.mqtt.user && !settings.mqttUser) {
+        settings.mqttUser = doc.mqtt.user;
+      }
+      if (doc.mqtt.password && !settings.mqttPass) {
+        settings.mqttPass = doc.mqtt.password;
+      }
+    }
+
+    const go2rtcStreams = (doc.go2rtc && doc.go2rtc.streams) || {};
+    const parsedCameras = {};
+
+    for (const [camName, camConfig] of Object.entries(doc.cameras)) {
+      if (camConfig.enabled === false) continue;
+
+      let go2rtcStreamName = null;
+      let rtspUrl = null;
+
+      // Find stream name used for 'detect' or 'record' role
+      if (camConfig.ffmpeg && camConfig.ffmpeg.inputs) {
+        for (const input of camConfig.ffmpeg.inputs) {
+          if (input.path) {
+            // Path might be e.g. rtsp://127.0.0.1:8554/driveway_2
+            const urlParts = input.path.split('/');
+            const lastPart = urlParts[urlParts.length - 1];
+            if (lastPart) {
+              go2rtcStreamName = lastPart;
+            }
+          }
+        }
+      }
+
+      // If no stream name found, default to camera name
+      if (!go2rtcStreamName) {
+        go2rtcStreamName = `${camName}_1`;
+      }
+
+      // Resolve RTSP URL to the go2rtc restream port 8554 instead of accessing cameras directly
+      const frigateIP = settings.go2rtcHost || 'localhost';
+      rtspUrl = `rtsp://${frigateIP}:8554/${go2rtcStreamName}`;
+
+      const width = (camConfig.detect && camConfig.detect.width) || 1280;
+      const height = (camConfig.detect && camConfig.detect.height) || 720;
+
+      parsedCameras[camName] = {
+        name: camName,
+        rtspUrl: rtspUrl,
+        go2rtcStreamName: go2rtcStreamName,
+        enabled: true,
+        detectionEnabled: detectionsState[camName] !== false,
+        width,
+        height
+      };
+    }
+
+    cameras = parsedCameras;
+    console.log('Successfully loaded cameras from Frigate config:', Object.keys(cameras));
+  } catch (err) {
+    console.error('Failed to parse Frigate config:', err);
+  }
+}
+
+// Dynamically fetch and parse active configuration from a remote Frigate server by IP address
+async function loadDynamicConfig(frigateIP) {
+  console.log(`[DYNAMIC] Fetching config from remote Frigate instance at http://${frigateIP}:5000/api/config...`);
+  try {
+    const response = await fetch(`http://${frigateIP}:5000/api/config`, { signal: AbortSignal.timeout(10000) });
+    if (!response.ok) {
+      throw new Error(`Frigate returned status ${response.status}: ${response.statusText}`);
+    }
+
+    const doc = await response.json(); // Frigate's /api/config endpoint returns the parsed JSON configuration!
+    if (!doc || !doc.cameras) {
+      throw new Error('Invalid or incomplete configuration returned by remote Frigate server.');
+    }
+
+    if (doc.mqtt) {
+      if (doc.mqtt.host && !settings.mqttHost) {
+        settings.mqttHost = doc.mqtt.host;
+      }
+      if (doc.mqtt.user && !settings.mqttUser) {
+        settings.mqttUser = doc.mqtt.user;
+      }
+      if (doc.mqtt.password && !settings.mqttPass) {
+        settings.mqttPass = doc.mqtt.password;
+      }
+    }
+
+    const go2rtcStreams = (doc.go2rtc && doc.go2rtc.streams) || {};
+    const parsedCameras = {};
+
+    for (const [camName, camConfig] of Object.entries(doc.cameras)) {
+      if (camConfig.enabled === false) continue;
+
+      let go2rtcStreamName = null;
+      if (camConfig.ffmpeg && camConfig.ffmpeg.inputs) {
+        for (const input of camConfig.ffmpeg.inputs) {
+          if (input.path) {
+            const urlParts = input.path.split('/');
+            const lastPart = urlParts[urlParts.length - 1];
+            if (lastPart) {
+              go2rtcStreamName = lastPart;
+            }
+          }
+        }
+      }
+
+      if (!go2rtcStreamName) {
+        go2rtcStreamName = `${camName}_1`;
+      }
+
+      // Automatically construct the RTSP URL using the specified Frigate IP and Port 8554 restream
+      const rtspUrl = `rtsp://${frigateIP}:8554/${go2rtcStreamName}`;
+
+      const width = (camConfig.detect && camConfig.detect.width) || 1280;
+      const height = (camConfig.detect && camConfig.detect.height) || 720;
+
+      parsedCameras[camName] = {
+        name: camName,
+        rtspUrl: rtspUrl,
+        go2rtcStreamName: go2rtcStreamName,
+        enabled: true,
+        detectionEnabled: detectionsState[camName] !== false,
+        width,
+        height
+      };
+    }
+
+    cameras = parsedCameras;
+    console.log(`[DYNAMIC] Successfully reloaded ${Object.keys(cameras).length} cameras dynamically from http://${frigateIP}:5000`);
+    io.emit('config-updated', { cameras });
+    return true;
+  } catch (err) {
+    console.warn(`[DYNAMIC WARNING] Failed to query dynamic remote config from ${frigateIP} (${err.message}). Falling back to local config file.`);
+    return false;
+  }
+}
+
+// Check if a point (x, y) resides within a polygon
+function isPointInPolygon(point, polygon) {
+  if (!polygon || polygon.length === 0) return true; // Default to full frame if no ROI defined
+
+  const x = point[0];
+  const y = point[1];
+  let inside = false;
+
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i][0];
+    const yi = polygon[i][1];
+    const xj = polygon[j][0];
+    const yj = polygon[j][1];
+
+    const intersect = ((yi > y) !== (yj > y)) &&
+      (x < (xj - xi) * (y - yi) / (yj - yi) + xi);
+    if (intersect) inside = !inside;
+  }
+
+  return inside;
+}
+
+// SMTP Alert Trigger
+function sendEmailAlert(cameraName, className, score, jpegBuffer) {
+  const { smtp } = settings;
+  if (smtp.enabled === false) {
+    console.log('[SMTP] SMTP email alerts are disabled in settings. Skipping email alert.');
+    return;
+  }
+  if (!smtp.user || !smtp.pass) {
+    console.warn('SMTP settings are incomplete. Skipping email alert.');
+    return;
+  }
+
+  const transporter = nodemailer.createTransport({
+    host: smtp.host,
+    port: smtp.port,
+    secure: smtp.secure,
+    auth: {
+      user: smtp.user,
+      pass: smtp.pass
+    }
+  });
+
+  const percentScore = Math.round(score * 100);
+  const attachments = [];
+  if (jpegBuffer) {
+    attachments.push({
+      filename: `${cameraName}-${className}.jpg`,
+      content: jpegBuffer
+    });
+  }
+
+  const mailOptions = {
+    from: smtp.user,
+    to: smtp.to || smtp.user,
+    subject: `[NVR ALERT] ${className.toUpperCase()} detected on ${cameraName}`,
+    text: `A ${className} (${percentScore}% confidence) was detected in the scanning window of the "${cameraName}" camera at ${new Date().toLocaleString()}.\n\n(See attached snapshot)`,
+    attachments
+  };
+
+  transporter.sendMail(mailOptions, (error, info) => {
+    if (error) {
+      console.error('SMTP Error:', error);
+    } else {
+      console.log(`Alert email sent for ${className} on ${cameraName}:`, info.response);
+    }
+  });
+}
+
+// On-demand Event Video Clip Saver from Frigate Events API (downloads complete package on event end)
+// On-demand Event Video Clip Proxy URL builder (to stream clips on-demand from Frigate APIs)
+function saveEventClipMQTT(cameraName, eventId, className, timestamp) {
+  const trackId = `frigate-${eventId}`;
+  const clipUrlVal = `/api/events/${eventId}/clip.mp4`;
+
+  console.log(`[CLIP] Event finished on ${cameraName}. Linking on-demand clip: ${clipUrlVal}`);
+
+  // Sync clipUrl to alertsHistory
+  const alertItem = alertsHistory.find(a => a.id === trackId);
+  if (alertItem) {
+    alertItem.clipUrl = clipUrlVal;
+    try {
+      fs.promises.writeFile(ALERTS_HISTORY_PATH, JSON.stringify(alertsHistory, null, 2), 'utf8').catch(() => {});
+    } catch (err) {}
+  }
+
+  // Notify client that video is available
+  io.emit('clip-saved', { 
+    trackId: trackId, 
+    cameraName,
+    className,
+    timestamp,
+    clipUrl: clipUrlVal
+  });
+}
+
+// Map to track active alerted event IDs and avoid duplicate alert triggers
+const alertedEvents = new Set();
+let mqttClient = null;
+
+// Setup and Connect/Reconnect to MQTT Broker dynamically
+function connectMQTT() {
+  if (mqttClient) {
+    console.log('[MQTT] Closing existing MQTT connection...');
+    mqttClient.end();
+    mqttClient = null;
+  }
+
+  const mqttBroker = settings.mqttHost || settings.go2rtcHost || '192.168.2.210';
+  const mqttUrl = `mqtt://${mqttBroker}`;
+  
+  const options = {};
+  if (settings.mqttUser) {
+    options.username = settings.mqttUser;
+  }
+  if (settings.mqttPass) {
+    options.password = settings.mqttPass;
+  }
+
+  const credsInfo = options.username ? ` (as user: ${options.username})` : '';
+  console.log(`[MQTT] Connecting to MQTT Broker at ${mqttUrl}${credsInfo}...`);
+  mqttClient = mqtt.connect(mqttUrl, options);
+  
+  mqttClient.on('connect', () => {
+    console.log('[MQTT] Connected to MQTT broker!');
+    mqttClient.subscribe('frigate/events', (err) => {
+      if (err) {
+        console.error('[MQTT Error] Failed to subscribe to frigate/events:', err);
+      } else {
+        console.log('[MQTT] Subscribed to topic "frigate/events"');
+      }
+    });
+  });
+  
+  mqttClient.on('error', (err) => {
+    console.error('[MQTT Error] MQTT Client encountered error:', err.message);
+  });
+  
+  mqttClient.on('message', async (topic, message) => {
+    if (topic !== 'frigate/events') return;
+    
+    try {
+      const event = JSON.parse(message.toString());
+      if (!event || !event.after) return;
+      
+      const eventId = event.after.id;
+      const cameraName = event.after.camera;
+      const label = event.after.label;
+      const score = event.after.top_score;
+      const type = event.type; // 'new', 'update', or 'end'
+      
+      // Check if camera is configured, enabled and has detection enabled
+      const cam = cameras[cameraName];
+      if (!cam || !cam.enabled || cam.detectionEnabled === false) return;
+      
+      // Check if the class is allowed in settings
+      if (!settings.detection.allowedClasses.includes(label)) return;
+      
+      // Check confidence score
+      if (score < settings.detection.confidenceThreshold) return;
+      
+      // Get camera resolution for normalization (default to 1280x720)
+      const width = cam.width || 1280;
+      const height = cam.height || 720;
+      
+      // raw Frigate box: [x_min, y_min, x_max, y_max]
+      const [xmin, ymin, xmax, ymax] = event.after.box;
+      const relX = xmin / width;
+      const relY = ymin / height;
+      const relW = (xmax - xmin) / width;
+      const relH = (ymax - ymin) / height;
+      const centroid = [relX + relW / 2, relY + relH / 2];
+      
+      // 1. Exclusion Zone Check
+      const isExcluded = exclusions[cameraName] && exclusions[cameraName].length >= 3 && isPointInPolygon(centroid, exclusions[cameraName]);
+      if (isExcluded) {
+        console.log(`[MQTT EXCLUDE] ${label.toUpperCase()} on camera "${cameraName}" was discarded (within Exclusion Zone).`);
+        return;
+      }
+      
+      // 2. ROI Check (Scan Window)
+      const isInsideROI = isPointInPolygon(centroid, rois[cameraName]);
+      if (!isInsideROI) {
+        // Discard if outside yellow scanning ROI
+        return;
+      }
+      
+      // 3. Handle NEW Alert Trigger
+      if (!alertedEvents.has(eventId)) {
+        alertedEvents.add(eventId);
+        
+        console.log(`[MQTT ALERT] New ${label} track initiated in ROI on ${cameraName} (Score: ${Math.round(score * 100)}%)`);
+        
+        const trackId = `frigate-${eventId}`;
+        const newTrack = {
+          id: trackId,
+          class: label,
+          bbox: [relX, relY, relW, relH],
+          centroid: centroid,
+          firstSeen: Date.now(),
+          lastSeen: Date.now(),
+          isParked: event.after.stationary || false,
+          alerted: true
+        };
+        
+        // Push to activeTracks so overlay renders it in real-time
+        if (!activeTracks[cameraName]) activeTracks[cameraName] = [];
+        activeTracks[cameraName] = [newTrack]; // replace or push
+        io.emit('tracks', { cameraName, tracks: activeTracks[cameraName] });
+        
+        // Notify frontend alert sidebar
+        io.emit('alert-triggered', { cameraName, track: newTrack, score });
+        
+        // Add to persistent alertsHistory
+        const historicalAlert = {
+          id: trackId,
+          cameraName,
+          track: newTrack,
+          score,
+          timestamp: Date.now(),
+          clipUrl: null
+        };
+        alertsHistory.unshift(historicalAlert);
+        if (alertsHistory.length > 100) {
+          alertsHistory = alertsHistory.slice(0, 100);
+        }
+        fs.promises.writeFile(ALERTS_HISTORY_PATH, JSON.stringify(alertsHistory, null, 2), 'utf8').catch(err => {
+          console.error('[HISTORY ERROR] Failed to save alert history:', err.message);
+        });
+        
+        // Fetch event snapshot for SMTP mail
+        try {
+          const snapshotUrl = `http://${settings.go2rtcHost}:5000/api/events/${eventId}/snapshot.jpg`;
+          const snapRes = await fetch(snapshotUrl);
+          if (snapRes.ok) {
+            const snapBuffer = Buffer.from(await snapRes.arrayBuffer());
+            sendEmailAlert(cameraName, label, score, snapBuffer);
+          } else {
+            sendEmailAlert(cameraName, label, score, null);
+          }
+        } catch (err) {
+          sendEmailAlert(cameraName, label, score, null);
+        }
+      } else {
+        // 4. Handle UPDATE Alert Tracker Box position in real-time
+        if (type === 'update') {
+          const trackId = `frigate-${eventId}`;
+          const currentTracks = activeTracks[cameraName] || [];
+          const existingTrack = currentTracks.find(t => t.id === trackId);
+          
+          if (existingTrack) {
+            existingTrack.bbox = [relX, relY, relW, relH];
+            existingTrack.centroid = centroid;
+            existingTrack.lastSeen = Date.now();
+            existingTrack.isParked = event.after.stationary || false;
+            
+            io.emit('tracks', { cameraName, tracks: currentTracks });
+          }
+        }
+      }
+      
+      // 5. Handle END of event -> download MP4 clip!
+      if (type === 'end') {
+        if (settings.detection.saveClips) {
+          saveEventClipMQTT(cameraName, eventId, label, Date.now());
+        }
+        
+        // Clean up track from frontend overlays
+        const trackId = `frigate-${eventId}`;
+        if (activeTracks[cameraName]) {
+          activeTracks[cameraName] = activeTracks[cameraName].filter(t => t.id !== trackId);
+          io.emit('tracks', { cameraName, tracks: activeTracks[cameraName] });
+        }
+        
+        // Prevent set from growing infinitely, prune old event IDs
+        if (alertedEvents.size > 200) {
+          const firstVal = alertedEvents.values().next().value;
+          alertedEvents.delete(firstVal);
+        }
+      }
+      
+    } catch (err) {
+      console.error('[MQTT ERROR] Error processing message payload:', err.message);
+    }
+  });
+}
+
+// WebRTC Signaling Proxy Endpoint to bypass browser CORS blocks
+app.post('/api/webrtc', async (req, res) => {
+  const { src } = req.query;
+  const sdpOffer = req.body; // Raw text SDP offer from browser
+
+  if (!src || !sdpOffer) {
+    return res.status(400).send('Missing src query or SDP offer body');
+  }
+
+  try {
+    const frigateIP = settings.go2rtcHost || '192.168.2.210';
+    const url = `http://${frigateIP}:5000/api/go2rtc/webrtc?src=${encodeURIComponent(src)}`;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      body: sdpOffer,
+      headers: {
+        'Content-Type': 'application/sdp'
+      }
+    });
+
+    if (!response.ok) {
+      return res.status(response.status).send(`Frigate returned error: ${response.statusText}`);
+    }
+
+    const sdpAnswer = await response.text();
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(sdpAnswer);
+  } catch (err) {
+    console.error('WebRTC proxy error:', err);
+    res.status(500).send(`WebRTC Proxy failed: ${err.message}`);
+  }
+});
+
+// Same-Origin MJPEG Stream Proxy to bypass browser cross-origin (CORS) throttling and connection drops
+app.get('/api/stream/:cameraName', (req, res) => {
+  const { cameraName } = req.params;
+  const frigateIP = settings.go2rtcHost || '192.168.2.210';
+  const url = `http://${frigateIP}:5000/api/${cameraName}`;
+
+  const proxyReq = http.request(url, (proxyRes) => {
+    // Copy status code and headers to the browser response
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error(`[PROXY ERROR] Failed to proxy stream for "${cameraName}":`, err.message);
+    res.status(500).send('Stream proxy failed');
+  });
+
+  // Clean up socket when the browser closes or navigates away
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
+});
+
+// Same-Origin Dynamic Event Video Clip Proxy to bypass browser cross-origin blocks and support HTTP 206 Range requests
+app.get('/api/events/:eventId/clip.mp4', (req, res) => {
+  const { eventId } = req.params;
+  const frigateIP = settings.go2rtcHost || '192.168.2.210';
+  const url = `http://${frigateIP}:5000/api/events/${eventId}/clip.mp4`;
+
+  console.log(`[CLIP PROXY] Proxying same-origin dynamic video clip for event ${eventId}...`);
+
+  // Build the HTTP request options forwarding browser range headers if any (critical for Safari/iOS HTML5 playback)
+  const options = {
+    method: 'GET',
+    headers: {}
+  };
+  if (req.headers.range) {
+    options.headers.range = req.headers.range;
+  }
+
+  const proxyReq = http.request(url, options, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    if (proxyRes.statusCode === 200 || proxyRes.statusCode === 206) {
+      proxyRes.pipe(new HevcPatchStream()).pipe(res);
+    } else {
+      proxyRes.pipe(res);
+    }
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error(`[CLIP PROXY ERROR] Failed to stream video clip for event ${eventId}:`, err.message);
+    res.status(500).send('Video clip proxy failed');
+  });
+
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
+});
+
+// Same-Origin Events Proxy to query historical event logs directly from Frigate's DB
+app.get('/api/events', (req, res) => {
+  const frigateIP = settings.go2rtcHost || '192.168.2.210';
+  const limit = req.query.limit || 60;
+  const url = `http://${frigateIP}:5000/api/events?limit=${limit}`;
+
+  const proxyReq = http.request(url, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error('[EVENTS PROXY ERROR] Failed to fetch events from Frigate:', err.message);
+    res.status(500).send('Events proxy failed');
+  });
+
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
+});
+
+// Same-Origin Dynamic Event Thumbnail Proxy to bypass cross-origin browser issues
+app.get('/api/events/:eventId/thumbnail.jpg', (req, res) => {
+  const { eventId } = req.params;
+  const frigateIP = settings.go2rtcHost || '192.168.2.210';
+  const url = `http://${frigateIP}:5000/api/events/${eventId}/thumbnail.jpg`;
+
+  const proxyReq = http.request(url, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error(`[THUMBNAIL PROXY ERROR] Failed to stream thumbnail for event ${eventId}:`, err.message);
+    res.status(404).send('Thumbnail not found');
+  });
+
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
+});
+
+// Same-Origin Dynamic Event Snapshot Proxy to bypass cross-origin browser issues
+app.get('/api/events/:eventId/snapshot.jpg', (req, res) => {
+  const { eventId } = req.params;
+  const frigateIP = settings.go2rtcHost || '192.168.2.210';
+  const url = `http://${frigateIP}:5000/api/events/${eventId}/snapshot.jpg`;
+
+  const proxyReq = http.request(url, (proxyRes) => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
+
+  proxyReq.on('error', (err) => {
+    console.error(`[SNAPSHOT PROXY ERROR] Failed to stream snapshot for event ${eventId}:`, err.message);
+    res.status(404).send('Snapshot not found');
+  });
+
+  req.on('close', () => {
+    proxyReq.destroy();
+  });
+
+  proxyReq.end();
+});
+
+// Express & Socket.io endpoints
+app.get('/api/config', (req, res) => {
+  res.json({
+    cameras,
+    rois,
+    exclusions,
+    settings
+  });
+});
+
+app.post('/api/roi', (req, res) => {
+  const { cameraName, roi } = req.body;
+  if (!cameraName || !Array.isArray(roi)) {
+    return res.status(400).json({ error: 'Invalid parameters' });
+  }
+
+  rois[cameraName] = roi;
+  fs.writeFileSync(ROIS_FILE_PATH, JSON.stringify(rois, null, 2), 'utf8');
+  console.log(`ROI updated for ${cameraName}`);
+  io.emit('config-updated', { rois });
+  res.json({ success: true, rois });
+});
+
+app.post('/api/exclusion', (req, res) => {
+  const { cameraName, exclusion } = req.body;
+  if (!cameraName || !Array.isArray(exclusion)) {
+    return res.status(400).json({ error: 'Invalid parameters' });
+  }
+
+  exclusions[cameraName] = exclusion;
+  fs.writeFileSync(EXCLUSIONS_FILE_PATH, JSON.stringify(exclusions, null, 2), 'utf8');
+  console.log(`Exclusion mask updated for ${cameraName}`);
+  io.emit('config-updated', { exclusions });
+  res.json({ success: true, exclusions });
+});
+
+app.post('/api/camera/detection', (req, res) => {
+  const { cameraName, enabled } = req.body;
+  if (!cameraName || typeof enabled !== 'boolean') {
+    return res.status(400).json({ error: 'Invalid parameters' });
+  }
+
+  if (cameras[cameraName]) {
+    cameras[cameraName].detectionEnabled = enabled;
+    detectionsState[cameraName] = enabled;
+    fs.writeFileSync(DETECTIONS_STATE_PATH, JSON.stringify(detectionsState, null, 2), 'utf8');
+    console.log(`Camera detection state updated for ${cameraName}: ${enabled}`);
+    io.emit('config-updated', { cameras });
+    res.json({ success: true, camera: cameras[cameraName] });
+  } else {
+    res.status(404).json({ error: 'Camera not found' });
+  }
+});
+
+// Unified AI endpoints (Ollama or Gemini)
+app.post('/api/gemini/summarize-event', async (req, res) => {
+  try {
+    const { camera, label, score, zones, duration, time, contextInfo } = req.body;
+
+    const prompt = `You are the Frigate NVR Smart AI Vision Security Analyst.
+Given this camera event:
+- Camera: ${camera}
+- Detected Object: ${label}
+- Confidence Score: ${(score * 100).toFixed(1)}%
+- Active Zones: ${zones ? zones.join(', ') : 'none'}
+- Time: ${time || 'Just now'}
+- Duration: ${duration} seconds
+- Context / Detection Notes: ${contextInfo || 'Object tracked across camera coordinate bounding field.'}
+
+Provide a concise, professional, tactical surveillance summary (2 sentences max), an assessed threat level ('low', 'medium', or 'high'), and 1 practical recommendation.
+Respond in valid JSON format only with keys:
+{
+  "summary": "...",
+  "threatLevel": "low" | "medium" | "high",
+  "recommendedAction": "..."
+}`;
+
+    const aiResponse = await performAiQuery(prompt, true);
+
+    if (!aiResponse) {
+      // Fallback local description
+      return res.json({
+        summary: `Detected a ${label} (${Math.round(score * 100)}% confidence) at ${camera.replace('_', ' ')} spanning ${zones?.join(', ') || 'unassigned zone'}. Event active for ${duration}s.`,
+        threatLevel: label === 'person' && zones?.includes('porch_doorstep') ? 'medium' : 'low',
+        recommendedAction: label === 'person' ? 'Check front door snapshot for courier/visitor.' : 'Normal automated tracking.',
+        isAIGenerated: false,
+      });
+    }
+
+    let text = aiResponse.trim();
+    if (text.startsWith('```json')) text = text.replace(/```json|```/g, '').trim();
+    else if (text.startsWith('```')) text = text.replace(/```/g, '').trim();
+
+    const parsed = JSON.parse(text);
+    res.json({
+      ...parsed,
+      isAIGenerated: true,
+    });
+  } catch (error) {
+    console.error('Error generating event description with AI:', error);
+    res.status(500).json({
+      error: error.message || 'Failed to generate AI analysis',
+      fallback: 'Event logged in Frigate timeline.',
+    });
+  }
+});
+
+app.post('/api/gemini/search-events', async (req, res) => {
+  try {
+    const { query, events } = req.body;
+
+    if (!query || !Array.isArray(events)) {
+      return res.json({ matchedEventIds: [] });
+    }
+
+    const prompt = `You are a search query interpreter for Frigate NVR security footage events.
+User search query: "${query}"
+
+Here are the candidate events:
+${JSON.stringify(
+  events.slice(0, 30).map((e) => ({
+    id: e.id,
+    camera: e.camera,
+    label: e.label,
+    time: new Date(e.start_time * 1000).toLocaleString(),
+  })),
+  null,
+  2
+)}
+
+Return a JSON object with:
+{
+  "matchedIds": ["id1", "id2"],
+  "explanation": "Why these match the query in 1 short sentence."
+}`;
+
+    const aiResponse = await performAiQuery(prompt, true);
+
+    if (!aiResponse) {
+      return res.json({ matchedIds: [], explanation: "AI service currently unavailable." });
+    }
+
+    let text = aiResponse.trim();
+    if (text.startsWith('```json')) text = text.replace(/```json|```/g, '').trim();
+    else if (text.startsWith('```')) text = text.replace(/```/g, '').trim();
+
+    const parsed = JSON.parse(text);
+    res.json(parsed);
+  } catch (err) {
+    console.error('Error in semantic search:', err);
+    res.status(500).json({ error: err.message, matchedIds: [] });
+  }
+});
+
+app.post('/api/settings', async (req, res) => {
+  const newSettings = req.body;
+  if (!newSettings || !newSettings.smtp || !newSettings.detection) {
+    return res.status(400).json({ error: 'Invalid settings object' });
+  }
+
+  const hostChanged = newSettings.go2rtcHost !== settings.go2rtcHost;
+  const mqttHostChanged = newSettings.mqttHost !== settings.mqttHost;
+  const mqttUserChanged = newSettings.mqttUser !== settings.mqttUser;
+  const mqttPassChanged = newSettings.mqttPass !== settings.mqttPass;
+  const mqttChanged = mqttHostChanged || mqttUserChanged || mqttPassChanged;
+
+  settings = { ...settings, ...newSettings };
+
+  // Sync changes to the active profile in settings.profiles
+  const profileIdx = settings.profiles.findIndex(p => p.id === settings.activeProfileId);
+  if (profileIdx !== -1) {
+    settings.profiles[profileIdx] = {
+      ...settings.profiles[profileIdx],
+      name: newSettings.profileName || settings.profiles[profileIdx].name,
+      go2rtcHost: settings.go2rtcHost,
+      go2rtcPort: settings.go2rtcPort,
+      connectionMode: settings.connectionMode,
+      mqttHost: settings.mqttHost,
+      mqttUser: settings.mqttUser,
+      mqttPass: settings.mqttPass,
+      geminiApiKey: settings.geminiApiKey,
+      smtp: { ...settings.smtp },
+      detection: { ...settings.detection }
+    };
+  }
+
+  fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2), 'utf8');
+  console.log('Settings updated successfully.');
+
+  // Reset AI client if key changed
+  if (newSettings.geminiApiKey !== settings.geminiApiKey) {
+    aiClient = null;
+  }
+
+  if (hostChanged && settings.go2rtcHost) {
+    console.log(`[DYNAMIC] Frigate host IP changed to: ${settings.go2rtcHost}. Attempting to reload cameras...`);
+    const loaded = await loadDynamicConfig(settings.go2rtcHost);
+    if (!loaded) {
+      console.log('Failed to load remote configuration. Profile IP might be unreachable.');
+    }
+    
+    // Preserve custom user MQTT settings if typed explicitly over auto-discovered config values
+    if (newSettings.mqttHost) settings.mqttHost = newSettings.mqttHost;
+    if (newSettings.mqttUser) settings.mqttUser = newSettings.mqttUser;
+    if (newSettings.mqttPass) settings.mqttPass = newSettings.mqttPass;
+
+    // Sync any preserved values back to the active profile
+    if (profileIdx !== -1) {
+      settings.profiles[profileIdx].mqttHost = settings.mqttHost;
+      settings.profiles[profileIdx].mqttUser = settings.mqttUser;
+      settings.profiles[profileIdx].mqttPass = settings.mqttPass;
+    }
+
+    fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2), 'utf8');
+    
+    connectMQTT();
+  } else if (mqttChanged) {
+    console.log(`[MQTT] MQTT Broker settings changed explicitly. Reconnecting...`);
+    connectMQTT();
+  }
+
+  io.emit('config-updated', { settings, cameras });
+  res.json({ success: true, settings });
+});
+
+app.post('/api/settings/profile/switch', async (req, res) => {
+  const { profileId } = req.body;
+  if (!profileId) {
+    return res.status(400).json({ error: 'Missing profileId' });
+  }
+
+  const profile = settings.profiles.find(p => p.id === profileId);
+  if (!profile) {
+    return res.status(404).json({ error: 'Profile not found' });
+  }
+
+  console.log(`[PROFILE] Switching active profile to "${profile.name}" (${profile.id})...`);
+  settings.activeProfileId = profile.id;
+  
+  // Synchronize properties to top level cache
+  settings.go2rtcHost = profile.go2rtcHost;
+  settings.go2rtcPort = profile.go2rtcPort;
+  settings.connectionMode = profile.connectionMode;
+  settings.mqttHost = profile.mqttHost;
+  settings.mqttUser = profile.mqttUser;
+  settings.mqttPass = profile.mqttPass;
+  settings.geminiApiKey = profile.geminiApiKey || '';
+  settings.smtp = { ...profile.smtp };
+  settings.detection = { ...profile.detection };
+
+  fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2), 'utf8');
+
+  // Trigger reloads and reconnection
+  if (settings.go2rtcHost) {
+    console.log(`[DYNAMIC] Loading cameras for new profile IP: ${settings.go2rtcHost}...`);
+    const loaded = await loadDynamicConfig(settings.go2rtcHost);
+    if (!loaded) {
+      console.log('Failed to load remote configuration for profile. Profile IP might be unreachable.');
+    }
+  }
+  connectMQTT();
+
+  io.emit('config-updated', { settings, cameras });
+  res.json({ success: true, settings, cameras });
+});
+
+app.post('/api/settings/profile/create', (req, res) => {
+  const { name } = req.body;
+  if (!name || name.trim() === '') {
+    return res.status(400).json({ error: 'Invalid profile name' });
+  }
+
+  const id = 'profile_' + Date.now();
+  
+  // Clone current settings as base
+  const newProfile = {
+    id,
+    name: name.trim(),
+    go2rtcHost: settings.go2rtcHost || '',
+    go2rtcPort: settings.go2rtcPort || '5000',
+    connectionMode: settings.connectionMode || 'mjpeg',
+    mqttHost: settings.mqttHost || '',
+    mqttUser: settings.mqttUser || '',
+    mqttPass: settings.mqttPass || '',
+    geminiApiKey: settings.geminiApiKey || '',
+    smtp: { ...settings.smtp },
+    detection: { ...settings.detection }
+  };
+
+  settings.profiles.push(newProfile);
+  settings.activeProfileId = id; // Switch immediately
+  
+  // Synchronize properties to top level cache
+  settings.go2rtcHost = newProfile.go2rtcHost;
+  settings.go2rtcPort = newProfile.go2rtcPort;
+  settings.connectionMode = newProfile.connectionMode;
+  settings.mqttHost = newProfile.mqttHost;
+  settings.mqttUser = newProfile.mqttUser;
+  settings.mqttPass = newProfile.mqttPass;
+  settings.geminiApiKey = newProfile.geminiApiKey || '';
+  settings.smtp = { ...newProfile.smtp };
+  settings.detection = { ...newProfile.detection };
+
+  fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2), 'utf8');
+
+  // Trigger reconnect/reload for the cloned state
+  if (settings.go2rtcHost) {
+    loadDynamicConfig(settings.go2rtcHost).then(loaded => {
+      if (!loaded) parseFrigateConfig();
+      io.emit('config-updated', { settings, cameras });
+    }).catch(() => {
+      parseFrigateConfig();
+      io.emit('config-updated', { settings, cameras });
+    });
+  } else {
+    io.emit('config-updated', { settings, cameras });
+  }
+  connectMQTT();
+
+  res.json({ success: true, settings, cameras });
+});
+
+app.post('/api/settings/profile/delete', (req, res) => {
+  const { profileId } = req.body;
+  if (!profileId) {
+    return res.status(400).json({ error: 'Missing profileId' });
+  }
+
+  if (profileId === 'default' && settings.profiles.length === 1) {
+    return res.status(400).json({ error: 'Cannot delete the only profile' });
+  }
+
+  const index = settings.profiles.findIndex(p => p.id === profileId);
+  if (index === -1) {
+    return res.status(404).json({ error: 'Profile not found' });
+  }
+
+  console.log(`[PROFILE] Deleting profile: ${profileId}`);
+  settings.profiles.splice(index, 1);
+
+  // If the deleted profile was active, switch to first available profile
+  if (settings.activeProfileId === profileId) {
+    const activeProfile = settings.profiles[0];
+    settings.activeProfileId = activeProfile.id;
+    settings.go2rtcHost = activeProfile.go2rtcHost;
+    settings.go2rtcPort = activeProfile.go2rtcPort;
+    settings.connectionMode = activeProfile.connectionMode;
+    settings.mqttHost = activeProfile.mqttHost;
+    settings.mqttUser = activeProfile.mqttUser;
+    settings.mqttPass = activeProfile.mqttPass;
+    settings.smtp = { ...activeProfile.smtp };
+    settings.detection = { ...activeProfile.detection };
+
+    if (settings.go2rtcHost) {
+      loadDynamicConfig(settings.go2rtcHost).then(loaded => {
+        if (!loaded) parseFrigateConfig();
+        io.emit('config-updated', { settings, cameras });
+      }).catch(() => {
+        parseFrigateConfig();
+        io.emit('config-updated', { settings, cameras });
+      });
+    }
+    connectMQTT();
+  }
+
+  fs.writeFileSync(SETTINGS_FILE_PATH, JSON.stringify(settings, null, 2), 'utf8');
+  io.emit('config-updated', { settings, cameras });
+  res.json({ success: true, settings });
+});
+
+app.post('/api/alerts/clear', (req, res) => {
+  alertsHistory = [];
+  try {
+    fs.writeFileSync(ALERTS_HISTORY_PATH, JSON.stringify(alertsHistory, null, 2), 'utf8');
+    console.log('Alert log history cleared successfully.');
+  } catch (err) {
+    console.error('Error writing alerts_history.json on clear:', err);
+  }
+  io.emit('alerts-cleared');
+  res.json({ success: true });
+});
+
+// Setup backend WebSockets
+io.on('connection', (socket) => {
+  console.log('Frontend client connected.');
+  socket.emit('init', { cameras, rois, exclusions, settings, alertsHistory });
+
+  // Handle requesting historical events over active WebSocket (bypasses WebView CORS/PNA fetch issues)
+  socket.on('get-events', async (limit, callback) => {
+    try {
+      const frigateIP = settings.go2rtcHost || 'localhost';
+      const limitVal = limit || 60;
+      const url = `http://${frigateIP}:5000/api/events?limit=${limitVal}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`Frigate returned status ${response.status}`);
+      const data = await response.json();
+      callback({ success: true, events: data });
+    } catch (err) {
+      console.error('[SOCKET GET-EVENTS ERROR]', err.message);
+      callback({ success: false, error: err.message });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    console.log('Frontend client disconnected.');
+  });
+});
+
+// Initialize System
+async function initSystem() {
+  console.log('Initializing custom NVR system...');
+  
+  if (!settings.go2rtcHost) {
+    settings.go2rtcHost = await discoverFrigateIP();
+    console.log(`Using auto-discovered Frigate IP: ${settings.go2rtcHost}`);
+  }
+
+  // Try dynamic network configuration load first; fallback to parsing local config.yml
+  const dynamicLoaded = await loadDynamicConfig(settings.go2rtcHost);
+  if (!dynamicLoaded) {
+    console.log('Falling back to local config.yml file parser.');
+    parseFrigateConfig();
+  }
+
+  server.listen(PORT, () => {
+    console.log(`\n======================================================`);
+    console.log(`Custom NVR Viewer running at: http://localhost:${PORT}`);
+    console.log(`======================================================\n`);
+    connectMQTT();
+  });
+}
+
+initSystem();

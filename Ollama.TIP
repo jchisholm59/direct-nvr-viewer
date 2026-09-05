@@ -1,0 +1,8 @@
+Add this to the .env file
+Then 
+npm install
+pm2 restart direct-nvr-viewer
+
+OLLAMA_URL=http://your-server-ip:11434
+OLLAMA_MODEL=llama3
+

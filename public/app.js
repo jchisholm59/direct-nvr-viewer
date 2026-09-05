@@ -1,0 +1,1618 @@
+// Detect if running inside a native mobile app container (Capacitor)
+const isCapacitorMobile = 
+  (typeof window !== 'undefined' && !!window.Capacitor) ||
+  window.location.protocol === 'capacitor:' || 
+  window.location.protocol === 'file:' || 
+  (window.location.hostname === 'localhost' && !window.location.port) ||
+  (window.location.hostname === 'localhost' && /android|iphone|ipad|ipod/i.test(navigator.userAgent));
+
+let BACKEND_URL = '';
+if (isCapacitorMobile) {
+  let savedUrl = localStorage.getItem('direct-nvr-backend-url') || '';
+  // If the saved URL points to localhost/loopback, clear it to force user setup of actual backend IP
+  if (savedUrl.includes('localhost') || savedUrl.includes('127.0.0.1') || savedUrl.includes('0.0.0.0')) {
+    savedUrl = '';
+    localStorage.removeItem('direct-nvr-backend-url');
+  }
+  BACKEND_URL = savedUrl;
+} else {
+  // On desktop/web, default to the current page origin to run out-of-the-box without setup prompts
+  BACKEND_URL = window.location.origin;
+}
+
+// Utility to resolve relative API/stream paths to the correct backend on both mobile and web
+function resolveUrl(path) {
+  if (!path) return '';
+  if (path.startsWith('http://') || path.startsWith('https://')) {
+    return path;
+  }
+  return BACKEND_URL + (path.startsWith('/') ? path : '/' + path);
+}
+
+// Override fetch to support remote backend URL for Capacitor mobile app
+const originalFetch = window.fetch;
+window.fetch = function(input, init) {
+  if (typeof input === 'string' && input.startsWith('/api/')) {
+    input = resolveUrl(input);
+  }
+  return originalFetch(input, init);
+};
+
+// Initialize socket pointing to the remote backend URL if configured, otherwise don't auto-connect
+const socket = BACKEND_URL ? io(BACKEND_URL) : io({ autoConnect: false });
+
+function getGo2rtcIP() {
+  if (appSettings && appSettings.go2rtcHost) return appSettings.go2rtcHost;
+  try {
+    if (BACKEND_URL) return new URL(BACKEND_URL).hostname;
+  } catch (e) {}
+  return window.location.hostname;
+}
+
+// Application Data
+let appCameras = {};
+let appRois = {};
+let appExclusions = {};
+let appSettings = {};
+let activeTracks = {}; // cameraName -> Array of tracks
+let renderedCameras = {};
+
+function areCamerasEqual(camListA, camListB) {
+  const keysA = Object.keys(camListA || {});
+  const keysB = Object.keys(camListB || {});
+  if (keysA.length !== keysB.length) return false;
+  return keysA.every(k => keysB.includes(k));
+}
+
+function getMjpegUrl(go2rtcIP, port, cam) {
+  const camName = cam.name || cam;
+  return resolveUrl(`/api/stream/${camName}`);
+}
+
+// Drawing State
+let drawingCamera = null;
+let drawingType = 'roi'; // 'roi' or 'exclusion'
+let drawingPoints = []; // Normalized [[x, y], ...]
+
+// UI Selectors
+const connStatusEl = document.getElementById('conn-status');
+const cameraGridEl = document.getElementById('camera-grid');
+const alertListEl = document.getElementById('alert-list');
+const noAlertsPlaceholderEl = document.getElementById('no-alerts-placeholder');
+const camCountEl = document.getElementById('cam-count');
+
+// Settings Selectors
+const openSettingsBtn = document.getElementById('open-settings-btn');
+const closeSettingsBtn = document.getElementById('close-settings-btn');
+const cancelSettingsBtn = document.getElementById('cancel-settings-btn');
+const settingsModal = document.getElementById('settings-modal');
+const settingsForm = document.getElementById('settings-form');
+const toggleSmtpPassBtn = document.getElementById('toggle-smtp-pass');
+const smtpPassInput = document.getElementById('smtp-pass');
+const toggleMqttPassBtn = document.getElementById('toggle-mqtt-pass');
+const mqttPassInput = document.getElementById('mqtt-pass');
+const toggleGeminiPassBtn = document.getElementById('toggle-gemini-pass');
+const geminiPassInput = document.getElementById('gemini-api-key');
+
+// AI Brief Selectors
+const aiBriefBtn = document.getElementById('ai-brief-btn');
+const aiBriefContainer = document.getElementById('ai-brief-container');
+const aiBriefText = document.getElementById('ai-brief-text');
+const aiBriefThreat = document.getElementById('ai-brief-threat');
+const aiBriefAction = document.getElementById('ai-brief-action');
+
+// AI Search Selectors
+const aiSearchInput = document.getElementById('ai-search-input');
+const aiSearchLoader = document.getElementById('ai-search-loader');
+
+// Sound indicator for new triggers
+const alertAudio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-84.wav');
+alertAudio.volume = 0.4;
+
+// Socket Connections
+socket.on('connect', () => {
+  connStatusEl.textContent = 'Live Connected';
+  connStatusEl.className = 'text-emerald-400 font-semibold';
+});
+
+socket.on('disconnect', () => {
+  connStatusEl.textContent = 'Disconnected';
+  connStatusEl.className = 'text-rose-400 font-semibold';
+});
+
+function restartStreams() {
+  console.log('[STREAMS] Restarting active camera streams in-place...');
+  Object.keys(appCameras).forEach(camName => {
+    const cam = appCameras[camName];
+    const go2rtcIP = getGo2rtcIP();
+    const port = appSettings.go2rtcPort || '5000';
+    const img = document.getElementById(`video-${camName}`);
+    if (img) {
+      if (img.tagName === 'IMG') {
+        const mjpegUrl = getMjpegUrl(go2rtcIP, port, cam);
+        img.src = `${mjpegUrl}?t=${Date.now()}`;
+      } else if (img.tagName === 'VIDEO') {
+        startWebRTC(cam.go2rtcStreamName, `video-${camName}`);
+      }
+    }
+  });
+}
+
+socket.on('init', (data) => {
+  const camerasChanged = !areCamerasEqual(renderedCameras, data.cameras);
+
+  appCameras = data.cameras;
+  appRois = data.rois;
+  appExclusions = data.exclusions || {};
+  appSettings = data.settings;
+  populateSettingsForm();
+  renderProfileSelectors();
+
+  if (camerasChanged) {
+    renderCameraGrid();
+    renderedCameras = { ...data.cameras };
+  } else {
+    console.log('[STREAMS] WebSocket reconnected/upgraded. Restarting active streams in-place to prevent black screens.');
+    restartStreams();
+  }
+});
+
+socket.on('alerts-cleared', () => {
+  alertListEl.innerHTML = '';
+  noAlertsPlaceholderEl.classList.remove('hidden');
+  alertListEl.appendChild(noAlertsPlaceholderEl);
+});
+
+socket.on('config-updated', (data) => {
+  if (data.cameras) {
+    const camerasChanged = !areCamerasEqual(renderedCameras, data.cameras);
+    appCameras = data.cameras;
+    if (camerasChanged) {
+      renderCameraGrid();
+      renderedCameras = { ...data.cameras };
+    }
+  }
+  if (data.rois) appRois = data.rois;
+  if (data.exclusions) appExclusions = data.exclusions;
+  if (data.settings) {
+    appSettings = data.settings;
+    populateSettingsForm();
+    renderProfileSelectors();
+    // Instantly fetch events for the new active profile
+    fetchEvents();
+  }
+});
+
+// Live Object Tracking Updates
+socket.on('tracks', (data) => {
+  activeTracks[data.cameraName] = data.tracks;
+  drawOverlay(data.cameraName);
+});
+
+// Real-time alert triggers
+socket.on('alert-triggered', (data) => {
+  // Flash camera card
+  flashCameraCard(data.cameraName);
+  
+  // Play alert chime
+  try {
+    alertAudio.play();
+  } catch (err) {}
+
+  // Instantly fetch newest events to populate the sidebar list
+  fetchEvents();
+});
+
+// Update the video feed grid dynamically
+function renderCameraGrid() {
+  const cameraNames = Object.keys(appCameras);
+  camCountEl.textContent = `${cameraNames.length} Streams Detected`;
+
+  if (cameraNames.length === 0) {
+    cameraGridEl.innerHTML = `
+      <div class="col-span-full py-16 flex flex-col items-center justify-center text-slate-500 bg-slate-900/20 rounded-xl border border-dashed border-slate-800">
+        <i class="fa-solid fa-circle-exclamation text-4xl mb-4 text-amber-500"></i>
+        <p class="text-lg font-medium text-slate-400">No Cameras Configured</p>
+        <p class="text-sm text-slate-500 mt-1">Ensure your go2rtc or cameras section of Frigate config is populated.</p>
+      </div>
+    `;
+    return;
+  }
+
+  cameraGridEl.innerHTML = '';
+  
+  cameraNames.forEach(camName => {
+    const cam = appCameras[camName];
+    
+    // Auto-detect IP if none provided by server settings
+    const go2rtcIP = getGo2rtcIP();
+    const port = appSettings.go2rtcPort || '5000';
+
+    const mjpegUrl = getMjpegUrl(go2rtcIP, port, cam);
+
+    const card = document.createElement('div');
+    card.id = `card-${camName}`;
+    card.className = 'camera-card bg-slate-900/90 border border-slate-800 rounded-2xl overflow-hidden shadow-xl flex flex-col hover:border-slate-700/60 transition duration-300 group';
+    
+    card.innerHTML = `
+      <!-- Camera Card Header -->
+      <div class="px-5 py-4 bg-slate-950/70 border-b border-slate-800/80 flex flex-wrap gap-4 justify-between items-center">
+        <div class="flex items-center gap-3">
+          <span class="h-2.5 w-2.5 rounded-full ${cam.detectionEnabled !== false ? 'bg-emerald-500 animate-pulse' : 'bg-slate-600'}"></span>
+          <div>
+            <h3 class="font-bold text-slate-200 capitalize tracking-wide text-sm">${camName}</h3>
+            <p class="text-[10px] ${cam.detectionEnabled !== false ? 'text-emerald-500 font-semibold' : 'text-slate-500'}">${cam.detectionEnabled !== false ? 'AI Active' : 'AI Paused'}</p>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2.5">
+          <!-- Toggle Switch -->
+          <label class="relative inline-flex items-center cursor-pointer mr-1">
+            <input type="checkbox" onchange="toggleDetection('${camName}', this.checked)" class="sr-only peer" ${cam.detectionEnabled !== false ? 'checked' : ''}>
+            <div class="w-8 h-4.5 bg-slate-800 rounded-full peer peer-focus:ring-0 peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-[2.5px] after:left-[2.5px] after:bg-slate-400 after:border-slate-300 after:border after:rounded-full after:h-3.5 after:w-3.5 after:transition-all peer-checked:bg-emerald-600 peer-checked:after:bg-white"></div>
+          </label>
+
+          <button id="draw-btn-${camName}" onclick="startDrawing('${camName}', 'roi')" class="text-xs bg-indigo-600/10 hover:bg-indigo-600/25 border border-indigo-500/20 text-indigo-300 hover:text-indigo-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5">
+            <i class="fa-solid fa-pen-ruler"></i> Scan Window
+          </button>
+          <button id="draw-ex-btn-${camName}" onclick="startDrawing('${camName}', 'exclusion')" class="text-xs bg-rose-600/10 hover:bg-rose-600/25 border border-rose-500/20 text-rose-300 hover:text-rose-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5">
+            <i class="fa-solid fa-circle-minus"></i> Ignore Zone
+          </button>
+          <button onclick="clearROI('${camName}')" class="text-xs bg-slate-800/60 hover:bg-slate-800 text-slate-400 hover:text-slate-200 px-2.5 py-1.5 rounded-lg transition">
+            Clear
+          </button>
+        </div>
+      </div>
+
+      <!-- Card Video Stream Container -->
+      <div class="video-container relative overflow-hidden bg-black cursor-pointer group" id="container-${camName}" onclick="zoomCamera('${camName}')">
+        ${appSettings.connectionMode === 'webrtc' 
+          ? `<video id="video-${camName}" class="video-iframe object-cover" autoplay playsinline muted></video>`
+          : `<img id="video-${camName}" class="video-iframe object-cover select-none pointer-events-none" src="${mjpegUrl}" onerror="mjpegError(this, '${camName}')" />`
+        }
+        <!-- Hover Controls Overlay (Frigate Portal Style!) -->
+        <div class="absolute inset-0 z-20 flex flex-col justify-between p-3.5 opacity-0 group-hover:opacity-100 transition duration-300 pointer-events-none">
+          <div class="flex justify-between items-start">
+            <div class="flex items-center gap-1.5 bg-slate-950/80 text-white border border-slate-800 px-2.5 py-1 rounded-full text-[10px] font-bold tracking-wider">
+              <span class="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span> LIVE
+            </div>
+          </div>
+          <div class="flex justify-end gap-2 pointer-events-auto">
+            <button onclick="event.stopPropagation(); refreshImageElement(document.getElementById('video-${camName}'), '${camName}')" class="h-8 w-8 bg-slate-950/85 hover:bg-slate-900 border border-slate-800 text-slate-300 hover:text-white rounded-lg flex items-center justify-center transition shadow-md" title="Force Reload Feed">
+              <i class="fa-solid fa-arrows-rotate text-xs"></i>
+            </button>
+            <button onclick="event.stopPropagation(); zoomCamera('${camName}')" class="h-8 w-8 bg-indigo-600/90 hover:bg-indigo-600 border border-indigo-500/40 text-white rounded-lg flex items-center justify-center transition shadow-md" title="Full Screen / Zoom Feed">
+              <i class="fa-solid fa-expand text-xs"></i>
+            </button>
+          </div>
+        </div>
+        <canvas id="canvas-${camName}" class="overlay-canvas"></canvas>
+      </div>
+
+      <!-- Live Stream Info Footer -->
+      <div class="px-5 py-3 bg-slate-950/30 text-xs text-slate-500 border-t border-slate-800/40 flex justify-between items-center">
+        <span class="font-mono text-[10px] text-slate-400 truncate max-w-[70%]">RTSP: ${cam.rtspUrl}</span>
+        <span class="bg-indigo-800/80 text-[10px] text-indigo-300 px-1.5 py-0.5 rounded uppercase font-bold tracking-wider">${appSettings.connectionMode === 'webrtc' ? 'Direct WebRTC' : 'MJPEG Stream'}</span>
+      </div>
+    `;
+
+    cameraGridEl.appendChild(card);
+    initCanvasEvents(camName);
+    
+    // Start native HTML5 WebRTC peer connection ONLY if in WebRTC mode
+    if (appSettings.connectionMode === 'webrtc') {
+      startWebRTC(cam.go2rtcStreamName, `video-${camName}`);
+    }
+    
+    // Draw initial empty/ROI frames
+    setTimeout(() => drawOverlay(camName), 500);
+  });
+}
+
+// Canvas interactions for ROI polygon drawing
+function initCanvasEvents(cameraName) {
+  const canvas = document.getElementById(`canvas-${cameraName}`);
+  if (!canvas) return;
+
+  canvas.addEventListener('click', (e) => {
+    if (drawingCamera !== cameraName) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const x = (e.clientX - rect.left) / rect.width;
+    const y = (e.clientY - rect.top) / rect.height;
+
+    drawingPoints.push([x, y]);
+    drawOverlay(cameraName);
+  });
+
+  // Complete drawing with right click
+  canvas.addEventListener('contextmenu', (e) => {
+    if (drawingCamera !== cameraName) return;
+    e.preventDefault();
+    finishDrawing(cameraName);
+  });
+
+  // Attach mousemove helper to draw temporary tracing lines
+  canvas.addEventListener('mousemove', (e) => {
+    if (drawingCamera !== cameraName || drawingPoints.length === 0) return;
+    
+    const rect = canvas.getBoundingClientRect();
+    const mx = (e.clientX - rect.left) / rect.width;
+    const my = (e.clientY - rect.top) / rect.height;
+    
+    drawOverlay(cameraName, [mx, my]);
+  });
+}
+
+function startDrawing(cameraName, type = 'roi') {
+  // If already drawing, complete previous
+  if (drawingCamera) {
+    const prevCam = drawingCamera;
+    finishDrawing(prevCam);
+  }
+
+  drawingCamera = cameraName;
+  drawingType = type;
+  drawingPoints = [];
+  
+  const canvas = document.getElementById(`canvas-${cameraName}`);
+  const activeBtn = type === 'roi' 
+    ? document.getElementById(`draw-btn-${cameraName}`) 
+    : document.getElementById(`draw-ex-btn-${cameraName}`);
+  
+  if (canvas) canvas.classList.add('drawing-mode');
+  if (activeBtn) {
+    activeBtn.textContent = type === 'roi' ? '💾 Save Scan Area' : '💾 Save Ignore Area';
+    activeBtn.className = 'text-xs bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded-lg font-bold transition flex items-center gap-1.5 shadow-lg shadow-emerald-600/25';
+    activeBtn.setAttribute('onclick', `finishDrawing('${cameraName}')`);
+  }
+}
+
+function finishDrawing(cameraName) {
+  if (drawingCamera !== cameraName) return;
+
+  const canvas = document.getElementById(`canvas-${cameraName}`);
+  const btnRoi = document.getElementById(`draw-btn-${cameraName}`);
+  const btnEx = document.getElementById(`draw-ex-btn-${cameraName}`);
+  
+  if (canvas) canvas.classList.remove('drawing-mode');
+  
+  // Restore both buttons to original HTML
+  if (btnRoi) {
+    btnRoi.innerHTML = '<i class="fa-solid fa-pen-ruler"></i> Scan Window';
+    btnRoi.className = 'text-xs bg-indigo-600/10 hover:bg-indigo-600/25 border border-indigo-500/20 text-indigo-300 hover:text-indigo-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5';
+    btnRoi.setAttribute('onclick', `startDrawing('${cameraName}', 'roi')`);
+  }
+  if (btnEx) {
+    btnEx.innerHTML = '<i class="fa-solid fa-circle-minus"></i> Ignore Zone';
+    btnEx.className = 'text-xs bg-rose-600/10 hover:bg-rose-600/25 border border-rose-500/20 text-rose-300 hover:text-rose-200 px-3 py-1.5 rounded-lg font-semibold transition flex items-center gap-1.5';
+    btnEx.setAttribute('onclick', `startDrawing('${cameraName}', 'exclusion')`);
+  }
+
+  const currentType = drawingType;
+
+  if (drawingPoints.length >= 3) {
+    const endpoint = currentType === 'roi' ? '/api/roi' : '/api/exclusion';
+    
+    // Send to backend
+    fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cameraName, [currentType]: drawingPoints })
+    })
+    .then(res => res.json())
+    .then(data => {
+      if (currentType === 'roi') {
+        appRois[cameraName] = drawingPoints;
+      } else {
+        appExclusions[cameraName] = drawingPoints;
+      }
+      drawingCamera = null;
+      drawingPoints = [];
+      drawOverlay(cameraName);
+    });
+  } else {
+    // Not enough vertices
+    drawingCamera = null;
+    drawingPoints = [];
+    drawOverlay(cameraName);
+  }
+}
+
+function clearROI(cameraName) {
+  if (confirm(`Are you sure you want to clear both scanning and ignore zones for ${cameraName}?`)) {
+    // Clear ROI
+    fetch('/api/roi', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cameraName, roi: [] })
+    })
+    .then(() => {
+      appRois[cameraName] = [];
+      // Clear Exclusion
+      return fetch('/api/exclusion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cameraName, exclusion: [] })
+      });
+    })
+    .then(() => {
+      appExclusions[cameraName] = [];
+      drawOverlay(cameraName);
+    });
+  }
+}
+
+// Canvas Overlay Painter (Draws ROIs, live tracks and active drawing vertices)
+function drawOverlay(cameraName, cursorCoords = null) {
+  const canvas = document.getElementById(`canvas-${cameraName}`);
+  if (canvas) {
+    drawCanvasContent(cameraName, canvas, cursorCoords);
+  }
+
+  // Draw on full-screen zoom-canvas simultaneously if zoomed in on this camera!
+  if (zoomedCamera === cameraName) {
+    const zoomCanvas = document.getElementById('zoom-canvas');
+    if (zoomCanvas) {
+      drawCanvasContent(cameraName, zoomCanvas);
+    }
+  }
+}
+
+// Modular helper to perform actual rendering on any target canvas
+function drawCanvasContent(cameraName, canvas, cursorCoords = null) {
+  const ctx = canvas.getContext('2d');
+  
+  // Set resolution match
+  const displayWidth = canvas.clientWidth;
+  const displayHeight = canvas.clientHeight;
+  
+  if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+    canvas.width = displayWidth;
+    canvas.height = displayHeight;
+  }
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  const w = canvas.width;
+  const h = canvas.height;
+
+  // 1. Draw Saved ROI Polygon
+  const roi = appRois[cameraName] || [];
+  if (roi.length > 0) {
+    ctx.beginPath();
+    ctx.moveTo(roi[0][0] * w, roi[0][1] * h);
+    for (let i = 1; i < roi.length; i++) {
+      ctx.lineTo(roi[i][0] * w, roi[i][1] * h);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(234, 179, 8, 0.95)'; // bright amber
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(234, 179, 8, 0.08)'; // transparent fill
+    ctx.fill();
+    
+    // Label ROI scanning window
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillStyle = 'rgba(234, 179, 8, 0.9)';
+    ctx.fillText('SCAN WINDOW (ROI)', roi[0][0] * w + 5, roi[0][1] * h - 5);
+  }
+
+  // 1.2 Draw Saved Exclusion Zone
+  const ex = appExclusions[cameraName] || [];
+  if (ex.length > 0) {
+    ctx.beginPath();
+    ctx.moveTo(ex[0][0] * w, ex[0][1] * h);
+    for (let i = 1; i < ex.length; i++) {
+      ctx.lineTo(ex[i][0] * w, ex[i][1] * h);
+    }
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(244, 63, 94, 0.95)'; // bright rose
+    ctx.lineWidth = 2.5;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(244, 63, 94, 0.15)'; // transparent filled rose
+    ctx.fill();
+
+    // Label Exclusion ignore zone
+    ctx.font = 'bold 10px sans-serif';
+    ctx.fillStyle = 'rgba(244, 63, 94, 0.9)';
+    ctx.fillText('IGNORE ZONE (EXCLUSION)', ex[0][0] * w + 5, ex[0][1] * h - 5);
+  }
+
+  // 2. Draw Active Drawing Polyline
+  if (drawingCamera === cameraName && drawingPoints.length > 0) {
+    ctx.beginPath();
+    ctx.moveTo(drawingPoints[0][0] * w, drawingPoints[0][1] * h);
+    for (let i = 1; i < drawingPoints.length; i++) {
+      ctx.lineTo(drawingPoints[i][0] * w, drawingPoints[i][1] * h);
+    }
+    
+    if (cursorCoords) {
+      ctx.lineTo(cursorCoords[0] * w, cursorCoords[1] * h);
+    }
+
+    ctx.strokeStyle = drawingType === 'roi' ? 'rgba(16, 185, 129, 0.9)' : 'rgba(244, 63, 94, 0.9)'; // emerald vs rose
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 4]); // dashed line for drafting
+    ctx.stroke();
+    ctx.setLineDash([]); // reset
+
+    // Draw coordinate dots
+    drawingPoints.forEach((pt, index) => {
+      ctx.beginPath();
+      ctx.arc(pt[0] * w, pt[1] * h, 4, 0, 2 * Math.PI);
+      ctx.fillStyle = drawingType === 'roi' ? '#10b981' : '#f43f5e';
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    });
+  }
+
+  // 3. Draw Active Track Bounding Boxes
+  const tracks = activeTracks[cameraName] || [];
+  tracks.forEach(track => {
+    const [tx, ty, tw, th] = track.bbox;
+    const boxX = tx * w;
+    const boxY = ty * h;
+    const boxW = tw * w;
+    const boxH = th * h;
+
+    // Use gray border for parked cars, vivid red for active alerts
+    let strokeStyle = 'rgba(239, 68, 68, 0.95)'; // red
+    let fillStyle = 'rgba(239, 68, 68, 0.05)';
+    let label = `${track.class.toUpperCase()}`;
+
+    if (track.isParked) {
+      strokeStyle = 'rgba(148, 163, 184, 0.7)'; // slate gray
+      fillStyle = 'rgba(148, 163, 184, 0.05)';
+      label = `PARKED ${track.class.toUpperCase()} (MUTED)`;
+    }
+
+    ctx.strokeStyle = strokeStyle;
+    ctx.lineWidth = 2.5;
+    ctx.strokeRect(boxX, boxY, boxW, boxH);
+    ctx.fillStyle = fillStyle;
+    ctx.fillRect(boxX, boxY, boxW, boxH);
+
+    // Draw label backgrounds
+    ctx.font = 'bold 11px sans-serif';
+    const textWidth = ctx.measureText(label).width;
+    ctx.fillStyle = strokeStyle;
+    ctx.fillRect(boxX - 1.25, boxY - 18, textWidth + 10, 18);
+    
+    // Draw text
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(label, boxX + 4, boxY - 5);
+  });
+}
+
+// Lightbox Expand Stream Zoom State Manager
+let zoomedCamera = null;
+const zoomModal = document.getElementById('zoom-modal');
+const zoomTitle = document.getElementById('zoom-title');
+const zoomContainer = document.getElementById('zoom-container');
+const closeZoomBtn = document.getElementById('close-zoom-btn');
+
+function zoomCamera(cameraName) {
+  if (drawingCamera) return; // Prevent zooming while editing scan windows
+
+  zoomedCamera = cameraName;
+  zoomTitle.textContent = `${cameraName} — Live Stream Zoom`;
+  zoomModal.classList.remove('hidden');
+
+  const cam = appCameras[cameraName];
+  const go2rtcIP = getGo2rtcIP();
+
+  // Clean up any old dynamically added video or img tag in zoom-container (keep the canvas!)
+  const oldPlayer = document.getElementById('zoom-player');
+  if (oldPlayer) oldPlayer.remove();
+
+  if (appSettings.connectionMode === 'webrtc') {
+    const video = document.createElement('video');
+    video.id = 'zoom-player';
+    video.className = 'video-iframe object-contain';
+    video.autoplay = true;
+    video.playsInline = true;
+    video.muted = true;
+    zoomContainer.insertBefore(video, document.getElementById('zoom-canvas'));
+    
+    startWebRTC(cam.go2rtcStreamName, 'zoom-player');
+  } else {
+    const port = appSettings.go2rtcPort || '5000';
+    const mjpegUrl = getMjpegUrl(go2rtcIP, port, cam);
+    const img = document.createElement('img');
+    img.id = 'zoom-player';
+    img.className = 'video-iframe object-contain select-none pointer-events-none';
+    img.src = mjpegUrl;
+    img.setAttribute('onerror', `mjpegError(this, '${cameraName}')`);
+    zoomContainer.insertBefore(img, document.getElementById('zoom-canvas'));
+  }
+
+  // Draw overlay on zoom-canvas immediately
+  setTimeout(() => {
+    const zoomCanvas = document.getElementById('zoom-canvas');
+    if (zoomCanvas) {
+      drawCanvasContent(cameraName, zoomCanvas);
+    }
+  }, 100);
+}
+
+function closeZoom() {
+  zoomedCamera = null;
+  zoomModal.classList.add('hidden');
+  const player = document.getElementById('zoom-player');
+  if (player) player.remove();
+}
+
+closeZoomBtn.addEventListener('click', closeZoom);
+
+// Sidebar State Variables
+let sidebarEvents = [];
+let filteredSidebarEvents = null; // Track search results separately
+let sidebarCurrentPage = 1;
+const EVENTS_PER_PAGE = 4;
+let unseenIds = new Set();
+let isFirstEventsLoad = true;
+
+// DOM Elements for Sidebar
+const sidebarPrevBtn = document.getElementById('sidebar-prev-page-btn');
+const sidebarNextBtn = document.getElementById('sidebar-next-page-btn');
+const sidebarPageLabel = document.getElementById('sidebar-page-label');
+const sidebarCounter = document.getElementById('sidebar-event-counter');
+const sidebarServerTitle = document.getElementById('sidebar-title-server');
+
+// Fetch events directly from Frigate's DB via our same-origin proxy or active WebSockets
+async function fetchEvents() {
+  const processEventsData = (data) => {
+    if (!Array.isArray(data)) return;
+
+    if (sidebarEvents.length > 0) {
+      // Identify new events to mark them as unseen
+      const prevIds = new Set(sidebarEvents.map(e => e.id));
+      const newUnseen = [];
+      data.forEach(e => {
+        if (!prevIds.has(e.id)) {
+          newUnseen.push(e.id);
+        }
+      });
+
+      if (newUnseen.length > 0) {
+        newUnseen.forEach(id => unseenIds.add(id));
+      }
+    }
+
+    sidebarEvents = data;
+
+    // Only render if we ARE NOT in the middle of an AI search
+    if (!aiSearchInput.value.trim()) {
+      filteredSidebarEvents = null;
+      renderEventsSidebar();
+    }
+
+    isFirstEventsLoad = false;
+  };
+
+  try {
+    // If WebSocket is connected, request events over WebSocket (extremely robust, bypasses WebView CORS/PNA fetch blocks)
+    if (socket && socket.connected) {
+      socket.emit('get-events', 60, (response) => {
+        if (response && response.success) {
+          processEventsData(response.events);
+        } else {
+          console.error('[EVENTS] WebSocket fetch returned error:', response ? response.error : 'unknown');
+        }
+      });
+      return;
+    }
+
+    // Fallback to HTTP fetch for desktop/unconnected states
+    const response = await fetch('/api/events?limit=60');
+    if (!response.ok) throw new Error('Failed to fetch events');
+    const data = await response.json();
+    processEventsData(data);
+  } catch (err) {
+    console.error('[EVENTS] Error polling events:', err.message);
+    if (isCapacitorMobile) {
+      const alertListEl = document.getElementById('alert-list');
+      if (alertListEl) {
+        alertListEl.innerHTML = `
+          <div class="text-center py-12 px-4 text-rose-400">
+            <i class="fa-solid fa-triangle-exclamation text-3xl mb-3 text-rose-500/80"></i>
+            <p class="text-sm font-semibold text-slate-300">Failed to Fetch Events</p>
+            <p class="text-[11px] text-slate-500 mt-2 bg-slate-950/60 p-2.5 rounded-lg border border-slate-850 break-all font-mono">${err.message}</p>
+          </div>
+        `;
+      }
+    }
+  }
+}
+
+function renderEventsSidebar() {
+  const eventsToRender = filteredSidebarEvents || sidebarEvents;
+
+  // Update Header Server Title
+  const activeProfile = appSettings.profiles ? appSettings.profiles.find(p => p.id === appSettings.activeProfileId) : null;
+  if (sidebarServerTitle) {
+    sidebarServerTitle.textContent = activeProfile ? activeProfile.name : 'Home Server';
+  }
+
+  // Update Total Counter
+  if (sidebarCounter) {
+    sidebarCounter.textContent = `${eventsToRender.length} Total`;
+  }
+
+  if (eventsToRender.length === 0) {
+    alertListEl.innerHTML = `
+      <div id="no-alerts-placeholder" class="text-center py-12 text-slate-500">
+        <i class="fa-solid fa-shield text-3xl mb-3 text-slate-700"></i>
+        <p class="text-sm font-medium text-slate-400">No events found</p>
+        <p class="text-xs text-slate-500 mt-1">Ready for real-time detections</p>
+      </div>
+    `;
+    // Disable pagination buttons
+    if (sidebarPrevBtn) sidebarPrevBtn.disabled = true;
+    if (sidebarNextBtn) sidebarNextBtn.disabled = true;
+    if (sidebarPageLabel) sidebarPageLabel.textContent = 'Page 1 of 1';
+    return;
+  }
+
+  noAlertsPlaceholderEl.classList.add('hidden');
+
+  // Pagination bounds
+  const totalPages = Math.ceil(eventsToRender.length / EVENTS_PER_PAGE);
+  if (sidebarCurrentPage > totalPages) sidebarCurrentPage = Math.max(1, totalPages);
+
+  const paginated = eventsToRender.slice(
+    (sidebarCurrentPage - 1) * EVENTS_PER_PAGE,
+    sidebarCurrentPage * EVENTS_PER_PAGE
+  );
+
+  // Update Pagination Controls
+  if (sidebarPrevBtn) sidebarPrevBtn.disabled = sidebarCurrentPage === 1;
+  if (sidebarNextBtn) sidebarNextBtn.disabled = sidebarCurrentPage === totalPages || totalPages === 0;
+  if (sidebarPageLabel) sidebarPageLabel.textContent = `Page ${sidebarCurrentPage} of ${totalPages || 1}`;
+
+  alertListEl.innerHTML = '';
+
+  paginated.forEach(event => {
+    const scorePercent = Math.round(event.data.score * 100);
+    const isUnseen = unseenIds.has(event.id);
+    
+    // Construct proxied URLs to route securely through our backend server
+    const thumbnailUrl = resolveUrl(`/api/events/${event.id}/thumbnail.jpg`);
+    const clipUrl = resolveUrl(`/api/events/${event.id}/clip.mp4`);
+
+    const eventCard = document.createElement('div');
+    eventCard.className = `event-card ${isUnseen ? 'unseen' : ''}`;
+    eventCard.addEventListener('click', () => {
+      // Mark as seen on click
+      if (unseenIds.has(event.id)) {
+        unseenIds.delete(event.id);
+        eventCard.classList.remove('unseen');
+      }
+      playClip(event);
+    });
+
+    eventCard.innerHTML = `
+      <!-- Left-side Vertical Time Block -->
+      <div class="event-time-block">
+        <span class="event-time-date">${formatDate(event.start_time)}</span>
+        <span class="event-time-clock">${formatTimeOnly(event.start_time)}</span>
+      </div>
+
+      <!-- Event Thumbnail -->
+      <div class="event-thumb-wrapper relative bg-slate-950 flex items-center justify-center">
+        <!-- Fallback icon centered behind the image -->
+        <div class="absolute inset-0 flex items-center justify-center text-slate-700"><i class="fa-solid fa-image text-xl"></i></div>
+        <img
+          src="${thumbnailUrl}"
+          alt="${event.label}"
+          class="event-thumb absolute inset-0 w-full h-full object-cover z-10"
+          onload="this.style.opacity='1';"
+          onerror="this.style.opacity='0';"
+          style="transition: opacity 0.2s ease-in-out; opacity: 0;"
+        />
+      </div>
+
+      <!-- Event Details -->
+      <div class="event-details">
+        <div class="event-meta-top">
+          <span class="event-camera-name">${event.camera}</span>
+          <span class="${getTagClass(event.label)}">${event.label}</span>
+        </div>
+        
+        <div class="flex justify-between items-center mt-1">
+          <span class="text-[11px] text-slate-400">🎯 ${scorePercent}%</span>
+          ${event.has_clip ? `
+            <span class="text-[10px] text-indigo-400 font-bold flex items-center gap-1">
+              🎬 Clip
+            </span>
+          ` : ''}
+        </div>
+      </div>
+    `;
+
+    alertListEl.appendChild(eventCard);
+  });
+}
+
+function formatDate(epoch) {
+  const date = new Date(epoch * 1000);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+
+  if (date.toDateString() === today.toDateString()) {
+    return "Today";
+  } else if (date.toDateString() === yesterday.toDateString()) {
+    return "Yest.";
+  }
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function formatTimeOnly(epoch) {
+  const date = new Date(epoch * 1000);
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: true });
+}
+
+function getTagClass(label) {
+  const l = label.toLowerCase();
+  if (l === "person") return "event-tag person";
+  if (l === "car" || l === "vehicle" || l === "truck") return "event-tag car";
+  if (["deer", "bear", "raccoon", "skunk", "dog", "cat", "bird", "rabbit", "rodent", "squirrel"].includes(l)) return "event-tag cat";
+  return "event-tag default";
+}
+
+// Lightbox modal event clip/snapshot players (Frigate Portal Style!)
+const clipModal = document.getElementById('clip-modal');
+const clipPlayer = document.getElementById('clip-player');
+const clipTitle = document.getElementById('clip-title');
+const closeClipBtn = document.getElementById('close-clip-btn');
+const clipSnapshotViewer = document.getElementById('clip-snapshot-viewer');
+const viewSnapshotBtn = document.getElementById('view-snapshot-btn');
+const viewClipBtn = document.getElementById('view-clip-btn');
+const clipModalLabel = document.getElementById('clip-modal-label');
+const clipModalTime = document.getElementById('clip-modal-time');
+
+let activeModalEvent = null;
+
+function playClip(event) {
+  activeModalEvent = event;
+  const snapshotUrl = resolveUrl(`/api/events/${event.id}/snapshot.jpg`);
+  const clipUrl = resolveUrl(`/api/events/${event.id}/clip.mp4`);
+
+  clipTitle.textContent = `Event Details — ${event.camera}`;
+  clipModalLabel.innerHTML = `Detected: <strong class="text-indigo-400 capitalize">${event.label}</strong>`;
+  clipModalTime.innerHTML = `Time: <strong>${new Date(event.start_time * 1000).toLocaleString()}</strong>`;
+
+  // Reset AI Brief
+  if (aiBriefContainer) {
+    aiBriefContainer.classList.add('hidden');
+    aiBriefText.textContent = '';
+  }
+
+  // Set error handler on player to alert user if Frigate is still rendering the clip file
+  clipPlayer.onerror = () => {
+    console.warn('[CLIP PLAYER] Video load failed. Frigate may still be finalizing this clip.');
+    alert('This video clip is currently being finalized by Frigate.\n\nPlease wait 5-10 seconds and try playing it again!');
+    setViewMode('snapshot', event.has_clip);
+  };
+
+  clipSnapshotViewer.src = snapshotUrl;
+  clipPlayer.src = clipUrl;
+
+  // Default view mode is Snapshot (matches Frigate Portal!)
+  setViewMode('snapshot', event.has_clip);
+
+  clipModal.classList.remove('hidden');
+}
+
+function setViewMode(mode, hasClip = true) {
+  if (mode === 'snapshot') {
+    // Show snapshot, hide video
+    clipSnapshotViewer.classList.remove('hidden');
+    clipPlayer.classList.add('hidden');
+    clipPlayer.pause();
+
+    // Style buttons with Indigo active states
+    viewSnapshotBtn.className = 'px-4 py-2 bg-indigo-600/20 border border-indigo-500/50 text-indigo-300 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 shadow-sm shadow-indigo-500/5';
+    if (hasClip) {
+      viewClipBtn.className = 'px-4 py-2 bg-slate-800/40 hover:bg-slate-850 hover:text-white border border-slate-800 text-slate-400 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 shadow-sm';
+      viewClipBtn.style.display = 'flex';
+    } else {
+      viewClipBtn.style.display = 'none';
+    }
+  } else {
+    // Show video, hide snapshot
+    clipSnapshotViewer.classList.add('hidden');
+    clipPlayer.classList.remove('hidden');
+
+    // Style buttons
+    viewSnapshotBtn.className = 'px-4 py-2 bg-slate-800/40 hover:bg-slate-850 hover:text-white border border-slate-800 text-slate-400 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 shadow-sm';
+    viewClipBtn.className = 'px-4 py-2 bg-indigo-600/20 border border-indigo-500/50 text-indigo-300 rounded-lg font-semibold text-xs transition flex items-center gap-1.5 shadow-sm shadow-indigo-500/5';
+
+    // Trigger playback
+    clipPlayer.load();
+    clipPlayer.play().catch(err => console.log('Autoplay blocked:', err));
+  }
+}
+
+function closeClip() {
+  clipPlayer.onerror = null; // Clean up handler
+  clipModal.classList.add('hidden');
+  clipPlayer.pause();
+  clipPlayer.src = '';
+  clipSnapshotViewer.src = '';
+  activeModalEvent = null;
+}
+
+if (closeClipBtn) {
+  closeClipBtn.addEventListener('click', closeClip);
+}
+
+// View switcher button listeners
+if (viewSnapshotBtn) {
+  viewSnapshotBtn.addEventListener('click', () => {
+    setViewMode('snapshot', activeModalEvent ? activeModalEvent.has_clip : true);
+  });
+}
+
+if (viewClipBtn) {
+  viewClipBtn.addEventListener('click', () => {
+    setViewMode('clip', true);
+  });
+}
+
+// Sidebar Pagination click listeners
+if (sidebarPrevBtn) {
+  sidebarPrevBtn.addEventListener('click', () => {
+    if (sidebarCurrentPage > 1) {
+      sidebarCurrentPage--;
+      renderEventsSidebar();
+    }
+  });
+}
+
+if (sidebarNextBtn) {
+  sidebarNextBtn.addEventListener('click', () => {
+    const totalPages = Math.ceil(sidebarEvents.length / EVENTS_PER_PAGE);
+    if (sidebarCurrentPage < totalPages) {
+      sidebarCurrentPage++;
+      renderEventsSidebar();
+    }
+  });
+}
+
+// Visual indicator of flash/highlight when clicking camera locations
+function flashCameraCard(cameraName) {
+  const card = document.getElementById(`card-${cameraName}`);
+  if (!card) return;
+
+  card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  card.classList.remove('border-slate-800');
+  card.classList.add('border-indigo-500', 'ring-2', 'ring-indigo-500/20');
+  
+  setTimeout(() => {
+    card.classList.remove('border-indigo-500', 'ring-2', 'ring-indigo-500/20');
+    card.classList.add('border-slate-800');
+  }, 1500);
+}
+
+// Settings & Config Handlers
+function populateSettingsForm() {
+  const { smtp, detection, go2rtcHost, go2rtcPort, connectionMode, mqttHost, mqttUser, mqttPass, geminiApiKey } = appSettings;
+  if (!smtp || !detection) return;
+
+  document.getElementById('smtp-enabled').checked = smtp.enabled !== false;
+  document.getElementById('smtp-host').value = smtp.host || 'smtp.gmail.com';
+  document.getElementById('smtp-port').value = smtp.port || 465;
+  document.getElementById('smtp-user').value = smtp.user || '';
+  document.getElementById('smtp-pass').value = smtp.pass || '';
+  document.getElementById('smtp-to').value = smtp.to || '';
+
+  document.getElementById('go2rtc-host').value = go2rtcHost || '';
+  document.getElementById('mqtt-host').value = mqttHost || '';
+  document.getElementById('mqtt-user').value = mqttUser || '';
+  document.getElementById('mqtt-pass').value = mqttPass || '';
+  document.getElementById('gemini-api-key').value = geminiApiKey || '';
+  document.getElementById('go2rtc-port').value = go2rtcPort || '5000';
+  document.getElementById('connection-mode').value = connectionMode || 'mjpeg';
+  document.getElementById('confidence-threshold').value = detection.confidenceThreshold || 0.5;
+  document.getElementById('check-interval').value = detection.intervalMs || 3000;
+  
+  // Load Save clips checkbox and clip duration setting
+  document.getElementById('save-clips').checked = detection.saveClips !== false;
+  document.getElementById('clip-duration').value = detection.clipDuration || 5;
+
+  const backendUrlInput = document.getElementById('backend-url-input');
+  if (backendUrlInput) {
+    backendUrlInput.value = BACKEND_URL || '';
+  }
+
+  // Toggle classes checkboxes
+  const checkboxes = document.querySelectorAll('input[name="classes"]');
+  checkboxes.forEach(cb => {
+    cb.checked = detection.allowedClasses.includes(cb.value);
+  });
+}
+
+function renderProfileSelectors() {
+  const dropdown = document.getElementById('header-profile-selector');
+  if (!dropdown) return;
+
+  const { profiles, activeProfileId } = appSettings;
+  if (!profiles || !Array.isArray(profiles)) return;
+
+  dropdown.innerHTML = profiles.map(p => `
+    <option value="${p.id}" ${p.id === activeProfileId ? 'selected' : ''} class="bg-slate-900 text-slate-100">
+      ${p.name}
+    </option>
+  `).join('');
+
+  const activeProfile = profiles.find(p => p.id === activeProfileId);
+  const nameInput = document.getElementById('profile-name-input');
+  if (nameInput && activeProfile) {
+    nameInput.value = activeProfile.name || '';
+  }
+}
+
+settingsForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+
+  const backendUrlInput = document.getElementById('backend-url-input');
+  if (backendUrlInput) {
+    let newUrl = backendUrlInput.value.trim();
+    if (newUrl) {
+      if (!newUrl.startsWith('http://') && !newUrl.startsWith('https://')) {
+        newUrl = 'http://' + newUrl;
+      }
+      if (newUrl.endsWith('/')) {
+        newUrl = newUrl.slice(0, -1);
+      }
+      if (newUrl !== BACKEND_URL) {
+        localStorage.setItem('direct-nvr-backend-url', newUrl);
+        BACKEND_URL = newUrl;
+        alert('Backend Server URL updated. App will now reload to apply the new URL.');
+        window.location.reload();
+        return;
+      }
+    }
+  }
+
+  const smtpPortValue = document.getElementById('smtp-port').value;
+  const smtp = {
+    enabled: document.getElementById('smtp-enabled').checked,
+    host: document.getElementById('smtp-host').value || 'smtp.gmail.com',
+    port: smtpPortValue ? parseInt(smtpPortValue) : 465,
+    secure: smtpPortValue ? (parseInt(smtpPortValue) === 465) : true,
+    user: document.getElementById('smtp-user').value || '',
+    pass: document.getElementById('smtp-pass').value || '',
+    to: document.getElementById('smtp-to').value || ''
+  };
+
+  const selectedClasses = Array.from(document.querySelectorAll('input[name="classes"]:checked')).map(cb => cb.value);
+
+  const newSettings = {
+    smtp,
+    profileName: document.getElementById('profile-name-input').value,
+    go2rtcHost: document.getElementById('go2rtc-host').value,
+    mqttHost: document.getElementById('mqtt-host').value,
+    mqttUser: document.getElementById('mqtt-user').value,
+    mqttPass: document.getElementById('mqtt-pass').value,
+    geminiApiKey: document.getElementById('gemini-api-key').value,
+    go2rtcPort: document.getElementById('go2rtc-port').value,
+    connectionMode: document.getElementById('connection-mode').value,
+    detection: {
+      intervalMs: parseInt(document.getElementById('check-interval').value),
+      confidenceThreshold: parseFloat(document.getElementById('confidence-threshold').value),
+      allowedClasses: selectedClasses,
+      saveClips: document.getElementById('save-clips').checked,
+      clipDuration: parseInt(document.getElementById('clip-duration').value)
+    }
+  };
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(newSettings)
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.success) {
+      alert('Settings saved successfully!');
+      settingsModal.classList.add('hidden');
+    }
+  });
+});
+
+// UI Event bindings
+openSettingsBtn.addEventListener('click', () => {
+  populateSettingsForm();
+  settingsModal.classList.remove('hidden');
+});
+closeSettingsBtn.addEventListener('click', () => settingsModal.classList.add('hidden'));
+cancelSettingsBtn.addEventListener('click', () => settingsModal.classList.add('hidden'));
+
+toggleSmtpPassBtn.addEventListener('click', () => {
+  const isPass = smtpPassInput.type === 'password';
+  smtpPassInput.type = isPass ? 'text' : 'password';
+  toggleSmtpPassBtn.innerHTML = isPass ? '<i class="fa-solid fa-eye-slash"></i>' : '<i class="fa-solid fa-eye"></i>';
+});
+
+toggleMqttPassBtn.addEventListener('click', () => {
+  const isPass = mqttPassInput.type === 'password';
+  mqttPassInput.type = isPass ? 'text' : 'password';
+  toggleMqttPassBtn.innerHTML = isPass ? '<i class="fa-solid fa-eye-slash"></i>' : '<i class="fa-solid fa-eye"></i>';
+});
+
+if (toggleGeminiPassBtn) {
+  toggleGeminiPassBtn.addEventListener('click', () => {
+    const isPass = geminiPassInput.type === 'password';
+    geminiPassInput.type = isPass ? 'text' : 'password';
+    toggleGeminiPassBtn.innerHTML = isPass ? '<i class="fa-solid fa-eye-slash"></i>' : '<i class="fa-solid fa-eye"></i>';
+  });
+}
+
+// AI Brief Generation Handler
+if (aiBriefBtn) {
+  aiBriefBtn.addEventListener('click', async () => {
+    if (!activeModalEvent) return;
+
+    aiBriefBtn.disabled = true;
+    aiBriefBtn.innerHTML = '<i class="fa-solid fa-spinner animate-spin"></i> Analyzing...';
+
+    try {
+      const response = await fetch('/api/gemini/summarize-event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          camera: activeModalEvent.camera,
+          label: activeModalEvent.label,
+          score: activeModalEvent.data.score,
+          zones: activeModalEvent.data.zones,
+          duration: Math.round(activeModalEvent.data.box[2] || 10), // using width as proxy for now or dummy
+          time: new Date(activeModalEvent.start_time * 1000).toLocaleString(),
+        })
+      });
+
+      const data = await response.json();
+
+      aiBriefText.textContent = data.summary || 'AI analysis complete.';
+      aiBriefThreat.textContent = (data.threatLevel || 'Low').toUpperCase();
+      aiBriefThreat.className = `text-[11px] font-black ${
+        data.threatLevel === 'high' ? 'text-rose-500' : data.threatLevel === 'medium' ? 'text-amber-500' : 'text-emerald-500'
+      }`;
+      aiBriefAction.textContent = data.recommendedAction || 'Monitor stream.';
+
+      aiBriefContainer.classList.remove('hidden');
+    } catch (err) {
+      console.error('[AI BRIEF ERROR]', err);
+      alert('AI Brief failed. Check your Gemini API key in settings.');
+    } finally {
+      aiBriefBtn.disabled = false;
+      aiBriefBtn.innerHTML = '<i class="fa-solid fa-brain"></i> Generate AI Brief';
+    }
+  });
+}
+
+// AI Semantic Search Handler
+if (aiSearchInput) {
+  let searchTimeout = null;
+  aiSearchInput.addEventListener('input', (e) => {
+    const query = e.target.value.trim();
+
+    // Clear previous timeout
+    if (searchTimeout) clearTimeout(searchTimeout);
+
+    if (!query) {
+      // Restore full list
+      filteredSidebarEvents = null;
+      fetchEvents();
+      return;
+    }
+
+    // Delay search to avoid spamming API
+    searchTimeout = setTimeout(async () => {
+      aiSearchLoader.classList.remove('hidden');
+
+      try {
+        const response = await fetch('/api/gemini/search-events', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            query: query,
+            events: sidebarEvents
+          })
+        });
+
+        const data = await response.json();
+
+        if (data.matchedIds && Array.isArray(data.matchedIds)) {
+          // Filter the sidebar list to only show matches
+          filteredSidebarEvents = sidebarEvents.filter(e => data.matchedIds.includes(e.id));
+          sidebarCurrentPage = 1;
+          renderEventsSidebar();
+        }
+      } catch (err) {
+        console.error('[AI SEARCH ERROR]', err);
+      } finally {
+        aiSearchLoader.classList.add('hidden');
+      }
+    }, 800);
+  });
+}
+
+// Quick Filter Logic
+function setQuickFilter(label) {
+  // Update UI active state
+  document.querySelectorAll('.filter-chip').forEach(chip => chip.classList.remove('active'));
+  document.getElementById(`filter-${label}`).classList.add('active');
+
+  if (label === 'all') {
+    aiSearchInput.value = '';
+    filteredSidebarEvents = null;
+    fetchEvents();
+    return;
+  }
+
+  // Use the AI search mechanism to filter by label
+  aiSearchInput.value = label;
+  // Trigger a fake input event to kick off the search
+  const event = new Event('input', { bubbles: true });
+  aiSearchInput.dispatchEvent(event);
+}
+
+// Profile Action Event Bindings
+document.getElementById('header-profile-selector').addEventListener('change', (e) => {
+  const profileId = e.target.value;
+  if (!profileId) return;
+
+  fetch('/api/settings/profile/switch', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId })
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.success) {
+      alert(`Switched server profile successfully!`);
+    } else {
+      alert(`Error switching profile: ${data.error}`);
+    }
+  });
+});
+
+document.getElementById('create-profile-btn').addEventListener('click', () => {
+  const name = prompt('Enter a name for the new server profile:');
+  if (!name || name.trim() === '') return;
+
+  fetch('/api/settings/profile/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name.trim() })
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.success) {
+      alert(`New profile "${name}" created and loaded!`);
+      settingsModal.classList.add('hidden');
+    } else {
+      alert(`Error creating profile: ${data.error}`);
+    }
+  });
+});
+
+document.getElementById('delete-profile-btn').addEventListener('click', () => {
+  const { profiles, activeProfileId } = appSettings;
+  const activeProfile = profiles.find(p => p.id === activeProfileId);
+  if (!activeProfile) return;
+
+  if (activeProfile.id === 'default' && profiles.length === 1) {
+    alert('Cannot delete the default profile as it is the only remaining profile.');
+    return;
+  }
+
+  const confirmDelete = confirm(`Are you sure you want to delete the profile "${activeProfile.name}"?\nThis action cannot be undone.`);
+  if (!confirmDelete) return;
+
+  fetch('/api/settings/profile/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ profileId: activeProfile.id })
+  })
+  .then(res => res.json())
+  .then(data => {
+    if (data.success) {
+      alert(`Profile deleted successfully.`);
+      settingsModal.classList.add('hidden');
+    } else {
+      alert(`Error deleting profile: ${data.error}`);
+    }
+  });
+});
+
+// Redraw all canvases on window resizing
+window.addEventListener('resize', () => {
+  Object.keys(appCameras).forEach(name => drawOverlay(name));
+});
+
+// Helper to reconstruct and refresh any MJPEG element cleanly without breaking query params
+function refreshImageElement(img, camName) {
+  if (!img) return;
+  const go2rtcIP = getGo2rtcIP();
+  const port = appSettings.go2rtcPort || '5000';
+  const cam = appCameras[camName];
+  if (cam) {
+    const mjpegUrl = getMjpegUrl(go2rtcIP, port, cam);
+    img.src = `${mjpegUrl}?t=${Date.now()}`;
+  }
+}
+
+// Global MJPEG connection drop helper
+window.mjpegError = function(img, camName) {
+  console.warn(`[MJPEG] Stream dropped or failed for camera "${camName}". Reconnecting in 3 seconds...`);
+  setTimeout(() => {
+    const el = document.getElementById(img.id);
+    if (el) {
+      refreshImageElement(el, camName);
+    }
+  }, 3000);
+};
+
+// Periodic MJPEG refresh every 5 minutes to prevent silent network/browser freezes
+setInterval(() => {
+  if (appSettings.connectionMode === 'mjpeg') {
+    console.log('[MJPEG] Performing periodic stream refresh to prevent silent freezes...');
+    Object.keys(appCameras).forEach(camName => {
+      const img = document.getElementById(`video-${camName}`);
+      refreshImageElement(img, camName);
+    });
+    // Also refresh zoomed player if open and in MJPEG mode
+    const zoomPlayer = document.getElementById('zoom-player');
+    if (zoomPlayer && zoomPlayer.tagName === 'IMG') {
+      refreshImageElement(zoomPlayer, zoomedCamera);
+    }
+  }
+}, 5 * 60 * 1000);
+
+// Manual stream refresh event listener
+document.getElementById('refresh-streams-btn').addEventListener('click', () => {
+  console.log('[STREAMS] Manual stream refresh initiated...');
+  Object.keys(appCameras).forEach(camName => {
+    const img = document.getElementById(`video-${camName}`);
+    refreshImageElement(img, camName);
+  });
+  // Also refresh zoom player if open
+  const zoomPlayer = document.getElementById('zoom-player');
+  if (zoomPlayer && zoomPlayer.tagName === 'IMG') {
+    refreshImageElement(zoomPlayer, zoomedCamera);
+  }
+});
+
+// Map to keep track of active PeerConnections so we can close them on retry/switch and avoid leaks
+const activePeerConnections = {};
+
+// Standalone Native WebRTC Player connecting to go2rtc proxied/native signaling
+async function startWebRTC(streamName, videoElementId) {
+  const videoEl = document.getElementById(videoElementId);
+  if (!videoEl) return;
+
+  const camName = streamName.split('_')[0];
+  const containerId = videoElementId === 'zoom-player' ? 'zoom-container' : `container-${camName}`;
+  const container = document.getElementById(containerId);
+
+  // Close existing PeerConnection for this element if any
+  if (activePeerConnections[videoElementId]) {
+    try {
+      activePeerConnections[videoElementId].close();
+    } catch (e) {}
+    delete activePeerConnections[videoElementId];
+  }
+
+  // Remove any old connection error overlay if present
+  if (container) {
+    const oldErr = container.querySelector('.webrtc-err-overlay');
+    if (oldErr) oldErr.remove();
+  }
+
+  const go2rtcIP = getGo2rtcIP();
+  const url = `/api/webrtc?src=${encodeURIComponent(streamName)}`;
+
+  console.log(`[WebRTC] Initializing track peer connection for ${streamName} referencing local CORS proxy at ${url}`);
+
+  const pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+  activePeerConnections[videoElementId] = pc;
+
+  pc.onconnectionstatechange = () => {
+    console.log(`[WebRTC] Connection state for ${streamName} on ${videoElementId}: ${pc.connectionState}`);
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      console.warn(`[WebRTC] Connection failed/disconnected for ${streamName} on ${videoElementId}. Reconnecting in 3 seconds...`);
+      pc.close();
+      if (activePeerConnections[videoElementId] === pc) {
+        delete activePeerConnections[videoElementId];
+      }
+      setTimeout(() => {
+        // Only reconnect if the element is still in the DOM
+        if (document.getElementById(videoElementId)) {
+          startWebRTC(streamName, videoElementId);
+        }
+      }, 3000);
+    }
+  };
+
+  pc.ontrack = (event) => {
+    console.log(`[WebRTC] Received incoming live track for ${streamName}`);
+    if (videoEl.srcObject !== event.streams[0]) {
+      videoEl.srcObject = event.streams[0];
+    }
+  };
+
+  pc.addTransceiver('video', { direction: 'recvonly' });
+  pc.addTransceiver('audio', { direction: 'recvonly' });
+
+  try {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+
+    // Wait for local ICE gathering to complete before POST
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        resolve(); // Timeout after 2.5 seconds if gathering takes too long
+      }, 2500);
+
+      if (pc.iceGatheringState === 'complete') {
+        clearTimeout(timer);
+        resolve();
+      } else {
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') {
+            clearTimeout(timer);
+            resolve();
+          }
+        };
+      }
+    });
+
+    // Check if pc was closed during gathering
+    if (pc.signalingState === 'closed') return;
+
+    const response = await fetch(url, {
+      method: 'POST',
+      body: pc.localDescription.sdp,
+      headers: {
+        'Content-Type': 'application/sdp'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Go2rtc signaling returned status ${response.status}: ${response.statusText}`);
+    }
+
+    const answerSdp = await response.text();
+    await pc.setRemoteDescription({
+      type: 'answer',
+      sdp: answerSdp
+    });
+
+    console.log(`[WebRTC] Tunnel connection 100% established for camera stream: ${streamName}`);
+  } catch (err) {
+    console.error(`[WebRTC ERROR] Direct peer connection failed for camera stream ${streamName}:`, err);
+    
+    // Render error panel over stream
+    if (container) {
+      // Remove any existing overlay first to avoid duplicates
+      const oldErr = container.querySelector('.webrtc-err-overlay');
+      if (oldErr) oldErr.remove();
+
+      const errBox = document.createElement('div');
+      errBox.className = 'webrtc-err-overlay absolute inset-0 flex flex-col items-center justify-center bg-slate-950/95 text-rose-400 p-4 text-center z-10';
+      errBox.innerHTML = `
+        <i class="fa-solid fa-triangle-exclamation text-2xl mb-2 text-rose-500 animate-pulse"></i>
+        <p class="text-xs font-bold uppercase tracking-wider">Stream Connection Failed</p>
+        <p class="text-[10px] text-slate-500 mt-1">${err.message}</p>
+        <p class="text-[9px] text-slate-600 mt-2">Retrying connection in 5 seconds...</p>
+      `;
+      container.appendChild(errBox);
+    }
+
+    // Schedule automatic reconnection retry
+    pc.close();
+    if (activePeerConnections[videoElementId] === pc) {
+      delete activePeerConnections[videoElementId];
+    }
+
+    setTimeout(() => {
+      if (document.getElementById(videoElementId)) {
+        console.log(`[WebRTC] Retrying connection for camera stream ${streamName}...`);
+        startWebRTC(streamName, videoElementId);
+      }
+    }, 5000);
+  }
+}
+
+// Toggle detection status for a specific camera stream
+function toggleDetection(cameraName, enabled) {
+  fetch('/api/camera/detection', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cameraName, enabled })
+  })
+  .then(res => res.json())
+  .then(data => {
+    appCameras[cameraName].detectionEnabled = enabled;
+    // Re-render the grid to update switches and statuses instantly
+    renderCameraGrid();
+    
+    if (!enabled) {
+      // Clear overlay tracks if turning off
+      activeTracks[cameraName] = [];
+      drawOverlay(cameraName);
+    }
+  });
+}
+
+// Start initial polling and set up the 4-second polling interval if connection is established
+if (BACKEND_URL) {
+  fetchEvents();
+  setInterval(fetchEvents, 4000);
+}
+
+// Initial Setup & Connection Management
+document.addEventListener('DOMContentLoaded', () => {
+  const setupOverlay = document.getElementById('setup-overlay');
+  const setupInput = document.getElementById('setup-backend-url-input');
+  const saveSetupBtn = document.getElementById('save-setup-btn');
+  const backendUrlInput = document.getElementById('backend-url-input');
+
+  if (backendUrlInput) {
+    backendUrlInput.value = BACKEND_URL;
+  }
+
+  if (isCapacitorMobile) {
+    // Always register the save button listener on mobile
+    if (saveSetupBtn) {
+      saveSetupBtn.addEventListener('click', () => {
+        let url = setupInput.value.trim();
+        if (!url) {
+          alert('Please enter a valid backend URL.');
+          return;
+        }
+        if (!url.startsWith('http://') && !url.startsWith('https://')) {
+          url = 'http://' + url;
+        }
+        if (url.endsWith('/')) {
+          url = url.slice(0, -1);
+        }
+        localStorage.setItem('direct-nvr-backend-url', url);
+        window.location.reload();
+      });
+    }
+
+    // Force setup overlay if no valid backend URL is configured
+    if (!BACKEND_URL) {
+      setupOverlay.classList.remove('hidden');
+    }
+
+    // Allow user to manually trigger the setup overlay by clicking the connection status element on mobile
+    if (connStatusEl) {
+      connStatusEl.style.cursor = 'pointer';
+      connStatusEl.title = 'Click to configure backend server URL';
+      connStatusEl.addEventListener('click', () => {
+        setupOverlay.classList.remove('hidden');
+        setupInput.value = BACKEND_URL;
+      });
+    }
+  } else {
+    // Desktop/web should never see the setup overlay. Delete it from the DOM.
+    if (setupOverlay) {
+      setupOverlay.remove();
+    }
+    // Also remove the "App Connection Settings" section from the Settings Modal on desktop.
+    const connectionSettings = document.getElementById('app-connection-settings');
+    if (connectionSettings) {
+      connectionSettings.remove();
+    }
+  }
+});

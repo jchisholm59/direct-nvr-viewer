@@ -1,0 +1,13 @@
+{
+  "appId": "com.direct.nvr",
+  "appName": "Direct NVR",
+  "webDir": "public",
+  "server": {
+    "androidScheme": "http"
+  },
+  "plugins": {
+    "CapacitorHttp": {
+      "enabled": false
+    }
+  }
+}

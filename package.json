@@ -1,0 +1,25 @@
+{
+  "name": "direct-nvr-viewer",
+  "version": "1.0.0",
+  "description": "Custom NVR viewer and real-time AI alerting engine",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "stop": "pkill -f 'node server.js' || true"
+  },
+  "dependencies": {
+    "@capacitor/android": "^8.5.0",
+    "@capacitor/core": "^8.5.0",
+    "@capacitor/ios": "^8.5.0",
+    "@google/genai": "^2.21.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "js-yaml": "^4.1.0",
+    "mqtt": "^5.15.2",
+    "nodemailer": "^6.9.14",
+    "socket.io": "^4.7.5"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^8.5.0"
+  }
+}
